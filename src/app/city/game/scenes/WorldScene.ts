@@ -24,6 +24,7 @@ import { EncounterSystem } from "../systems/EncounterSystem";
 import { AgentSystem } from "../systems/AgentSystem";
 import { DialogueSystem } from "../systems/DialogueSystem";
 import { CameraSystem } from "../systems/CameraSystem";
+import { ZoneSystem } from "../systems/ZoneSystem";
 import {
   setupTrendingZone,
   clearTrafficTimers,
@@ -171,6 +172,9 @@ export class WorldScene extends Phaser.Scene {
   /** Mobile camera drag/pan/zoom + tap-vs-drag detection. */
   public cameraSystem: CameraSystem = new CameraSystem(this);
 
+  /** Zone transitions, setup/clear, offscreen caching, popup-building registry. */
+  public zoneSystem: ZoneSystem = new ZoneSystem(this);
+
   /** Sky gradient, stars, time-of-day palette, sun/moon, weather effects.
    *  Constructed in create() once the day/night overlay exists. */
   public skySystem!: SkySystem;
@@ -183,6 +187,27 @@ export class WorldScene extends Phaser.Scene {
   /** Passthrough — TooltipSystem derives a status label via the scene. */
   public getStatusFromHealth(health: number): BuildingStatus {
     return this.buildingSystem.getStatusFromHealth(health);
+  }
+
+  // ── Zone passthroughs ───────────────────────────────────────────────────
+  // Zone setup files call these on the scene; they delegate to ZoneSystem.
+  registerZonePopupBuilding(
+    id: string,
+    sprite: Phaser.GameObjects.Sprite,
+    data: GameBuilding,
+    zone: ZoneType,
+    onInteract: () => void
+  ): void {
+    this.zoneSystem.registerZonePopupBuilding(id, sprite, data, zone, onInteract);
+  }
+  unregisterZonePopupBuilding(id: string): void {
+    this.zoneSystem.unregisterZonePopupBuilding(id);
+  }
+  unregisterZonePopupBuildingsByZone(zone: ZoneType): void {
+    this.zoneSystem.unregisterZonePopupBuildingsByZone(zone);
+  }
+  storeZoneElementPositions(elements: Phaser.GameObjects.GameObject[]): void {
+    this.zoneSystem.storeZoneElementPositions(elements);
   }
 
   // ── Decoration passthroughs ─────────────────────────────────────────────
@@ -211,9 +236,8 @@ export class WorldScene extends Phaser.Scene {
 
   // Zone system
   public currentZone: ZoneType = "main_city";
-  private isTransitioning = false; // Prevent overlapping transitions
+  public isTransitioning = false; // Prevent overlapping transitions
   public trendingElements: Phaser.GameObjects.GameObject[] = [];
-  private mainCityElements: Phaser.GameObjects.GameObject[] = [];
   public academyElements: Phaser.GameObjects.GameObject[] = []; // Academy zone elements
   public ballersElements: Phaser.GameObjects.GameObject[] = []; // Ballers Valley zone elements
   public foundersElements: Phaser.GameObjects.GameObject[] = []; // Founder's Corner zone elements
@@ -259,8 +283,8 @@ export class WorldScene extends Phaser.Scene {
   public academyMoon: Phaser.GameObjects.Arc | null = null; // Moon for Academy zone
   public academyStars: Phaser.GameObjects.Arc[] = []; // Extra bright stars for Academy
   private boundZoneChange: ((e: Event) => void) | null = null;
-  private zoneGround: Phaser.GameObjects.TileSprite | null = null;
-  private zonePath: Phaser.GameObjects.TileSprite | null = null;
+  public zoneGround: Phaser.GameObjects.TileSprite | null = null;
+  public zonePath: Phaser.GameObjects.TileSprite | null = null;
   public billboardTexts: Phaser.GameObjects.Text[] = [];
   public tickerText: Phaser.GameObjects.Text | null = null;
   public tickerOffset = 0;
@@ -270,7 +294,6 @@ export class WorldScene extends Phaser.Scene {
   public worldStateVersion = 0;
   public skylineSprites: Phaser.GameObjects.Sprite[] = [];
   public distantSkylineGfx: (Phaser.GameObjects.Graphics | Phaser.GameObjects.Rectangle)[] = []; // Persistent background skyline (not animated in transitions)
-  private academyBuildings: Phaser.GameObjects.Sprite[] = []; // Academy building sprites
   public billboardTimer: Phaser.Time.TimerEvent | null = null;
   public trafficTimers: Phaser.Time.TimerEvent[] = [];
   public originalPositions: Map<Phaser.GameObjects.GameObject, number> = new Map(); // Store original X positions
@@ -327,7 +350,7 @@ export class WorldScene extends Phaser.Scene {
   private helperGreeted = false;
 
   // NPC Awareness — NPCs greet the player when approached
-  private previousNearbyNPC: GameCharacter | null = null;
+  public previousNearbyNPC: GameCharacter | null = null;
   public npcGreetCooldowns: Map<string, number> = new Map();
   public readonly NPC_GREET_COOLDOWN_MS = 60000; // 60s per NPC
   public lastNpcGreetTime = 0;
@@ -341,12 +364,12 @@ export class WorldScene extends Phaser.Scene {
   private boundEnterWorld: ((e: Event) => void) | null = null;
   private boundExitWorld: ((e: Event) => void) | null = null;
   private boundTutorialStep: ((e: Event) => void) | null = null;
-  private pendingEnterWorld: (() => void) | null = null; // Queued spawn when zone is transitioning
+  public pendingEnterWorld: (() => void) | null = null; // Queued spawn when zone is transitioning
 
   public isMobile = false;
 
   // Immersive camera state
-  private cameraFollowing = false;
+  public cameraFollowing = false;
   private irisGraphics: Phaser.GameObjects.Graphics | null = null;
 
   // Drag detection: prevents accidental taps when scrolling on mobile
@@ -403,7 +426,7 @@ export class WorldScene extends Phaser.Scene {
     this.decorationSystem.createAnimals();
 
     // Store original positions of decorations and animals for zone transitions
-    this.storeOriginalPositions();
+    this.zoneSystem.storeOriginalPositions();
 
     // Create ambient particles (pollen/leaves)
     this.decorationSystem.createAmbientParticles();
@@ -433,7 +456,7 @@ export class WorldScene extends Phaser.Scene {
     window.addEventListener("agencity-bot-pokemon", this.boundBotPokemon);
 
     // Listen for zone change events
-    this.boundZoneChange = (e: Event) => this.handleZoneChange(e as CustomEvent);
+    this.boundZoneChange = (e: Event) => this.zoneSystem.handleZoneChange(e as CustomEvent);
     window.addEventListener("agencity-zone-change", this.boundZoneChange);
 
     // Register cleanup on scene shutdown and destroy
@@ -1893,779 +1916,6 @@ export class WorldScene extends Phaser.Scene {
   }
 
 
-  private handleZoneChange(event: CustomEvent<{ zone: ZoneType }>): void {
-    const newZone = event.detail.zone;
-    if (newZone === this.currentZone || this.isTransitioning) return;
-
-    // Transition to new zone
-    this.transitionToZone(newZone);
-  }
-
-  private transitionToZone(newZone: ZoneType): void {
-    this.audioSystem.playZoneTransitionSfx();
-
-    // Mark transition in progress and cancel any active tap-to-move
-    this.isTransitioning = true;
-    this.moveTarget = null;
-    this.moveTargetBuilding = null;
-    this.moveTargetNPC = null;
-
-    // Hide helper NPC during transitions; she only lives in the city
-    if (this.helperNPC) {
-      this.helperNPC.setVisible(false);
-      const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
-      if (indicator) indicator.setVisible(false);
-    }
-
-    // Pause camera follow during transition
-    if (this.cameraFollowing) {
-      this.cameras.main.stopFollow();
-    }
-
-    // CLEANUP: Kill any existing transition tweens to prevent accumulation
-    this.decorations.forEach((d) => this.tweens.killTweensOf(d));
-    this.animals.forEach((a) => this.tweens.killTweensOf(a.sprite));
-    this.trendingElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.billboardTexts.forEach((t) => this.tweens.killTweensOf(t));
-    this.skylineSprites.forEach((s) => this.tweens.killTweensOf(s));
-    if (this.tickerText) this.tweens.killTweensOf(this.tickerText);
-    this.ballersElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.foundersElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.labsElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.moltbookElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.arenaElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.ascensionElements.forEach((el) => this.tweens.killTweensOf(el));
-    this.buildingSprites.forEach((container) => this.tweens.killTweensOf(container));
-    this.characterSprites.forEach((sprite) => this.tweens.killTweensOf(sprite));
-
-    // Reset all zone element positions to originals before transition
-    // (slide-out animations corrupt x positions; this ensures correct starting positions)
-    this.decorations.forEach((d) => {
-      const origX = this.originalPositions.get(d);
-      if (origX !== undefined) (d as any).x = origX;
-    });
-    this.animals.forEach((a) => {
-      const origX = this.originalPositions.get(a.sprite);
-      if (origX !== undefined) (a.sprite as any).x = origX;
-    });
-    this.resetZoneElementPositions(this.trendingElements);
-    this.resetZoneElementPositions(this.skylineSprites);
-    this.resetZoneElementPositions(this.billboardTexts);
-    this.resetZoneElementPositions(this.ballersElements);
-    this.resetZoneElementPositions(this.foundersElements);
-    this.resetZoneElementPositions(this.labsElements);
-    this.resetZoneElementPositions(this.moltbookElements);
-    this.resetZoneElementPositions(this.arenaElements);
-    this.resetZoneElementPositions(this.ascensionElements);
-
-    // Determine slide direction: Labs -> Moltbook Beach -> Park -> Catalog -> Ballers Valley -> Founder's Corner -> Arena (left to right)
-    // Zone order: labs (-2) -> moltbook (-1) -> main_city (0) -> trending (1) -> ballers (2) -> founders (3) -> arena (4)
-    const zoneOrder: Record<ZoneType, number> = {
-      labs: -2,
-      moltbook: -1,
-      main_city: 0,
-      trending: 1,
-      ballers: 2,
-      founders: 3,
-      arena: 4,
-      ascension: 5,
-    };
-    const isGoingRight = zoneOrder[newZone] > zoneOrder[this.currentZone];
-    const isAscensionTransition = newZone === "ascension" || this.currentZone === "ascension";
-    const isVerticalTransition = isAscensionTransition;
-    const duration = isVerticalTransition ? 800 : 600; // Slower, dramatic for vertical transitions
-    const slideDistance = Math.round(850 * SCALE); // Slightly more than screen width for full slide (scaled)
-
-    // For ascension: vertical transition (ascend)
-    // For all others: horizontal slide
-    const slideOutOffset = isVerticalTransition ? 0 : isGoingRight ? -slideDistance : slideDistance;
-    const slideInOffset = isVerticalTransition ? 0 : isGoingRight ? slideDistance : -slideDistance;
-
-    // Collect current zone elements to slide out
-    const oldElements: (Phaser.GameObjects.GameObject & { x?: number })[] = [];
-
-    if (this.currentZone === "trending") {
-      oldElements.push(...this.trendingElements);
-      oldElements.push(...this.billboardTexts);
-      if (this.tickerText) oldElements.push(this.tickerText);
-      oldElements.push(...this.skylineSprites);
-    } else if (this.currentZone === "ballers") {
-      oldElements.push(...this.ballersElements);
-    } else if (this.currentZone === "founders") {
-      oldElements.push(...this.foundersElements);
-    } else if (this.currentZone === "labs") {
-      oldElements.push(...this.labsElements);
-    } else if (this.currentZone === "moltbook") {
-      oldElements.push(...this.moltbookElements);
-    } else if (this.currentZone === "arena") {
-      oldElements.push(...this.arenaElements);
-    } else if (this.currentZone === "ascension") {
-      oldElements.push(...this.ascensionElements);
-    } else {
-      // Main city (Park) decorations
-      this.decorations.forEach((d) => oldElements.push(d));
-      this.animals.forEach((a) => oldElements.push(a.sprite));
-    }
-
-    // Snapshot building/character sprite IDs at transition start
-    // Only these will be destroyed after transition — sprites created mid-transition by worldState updates are preserved
-    const oldBuildingSpriteIds = new Set(this.buildingSprites.keys());
-    const oldCharacterSpriteIds = new Set(this.characterSprites.keys());
-
-    // Include buildings and characters (they slide out and get recreated)
-    this.buildingSprites.forEach((container) => oldElements.push(container));
-    this.characterSprites.forEach((sprite) => oldElements.push(sprite));
-
-    // Store old element original X positions for proper destruction
-    const oldElementData = oldElements.map((el) => ({ el, origX: (el as any).x || 0 }));
-
-    // Create transition overlay for ground swap (slides with content, scaled)
-    const transitionOverlay = this.add.rectangle(
-      GAME_WIDTH / 2 + slideInOffset,
-      Math.round(520 * SCALE),
-      GAME_WIDTH,
-      Math.round(200 * SCALE),
-      {
-        trending: 0x374151,
-        labs: 0x1a1a2e,
-        arena: 0x2d1b4e,
-        ascension: 0xe8e8f0,
-        moltbook: 0xc2b280,
-        ballers: 0x22c55e,
-        founders: 0x8b6914,
-        main_city: 0x22c55e,
-      }[this.currentZone] || 0x22c55e, // Zone-appropriate ground color
-      1
-    );
-    transitionOverlay.setDepth(0);
-
-    if (isAscensionTransition) {
-      const verticalDist = Math.round(600 * SCALE);
-      const isEnteringAscension = newZone === "ascension";
-
-      // Entering ascension (flying up): old elements slide DOWN (world drops away)
-      // Leaving ascension (descending): old elements slide UP (world rises away)
-      const verticalDelta = isEnteringAscension ? verticalDist : -verticalDist;
-      oldElementData.forEach(({ el }) => {
-        if ((el as any).y !== undefined) {
-          this.tweens.add({
-            targets: el,
-            y: (el as any).y + verticalDelta,
-            alpha: 0,
-            duration,
-            ease: "Cubic.easeIn",
-          });
-          // Slide character drop shadow with its sprite so it doesn't lag
-          const shadow = (el as any)._shadow as Phaser.GameObjects.Sprite | undefined;
-          if (shadow && shadow.active) {
-            this.tweens.add({
-              targets: shadow,
-              y: shadow.y + verticalDelta,
-              alpha: 0,
-              duration,
-              ease: "Cubic.easeIn",
-            });
-          }
-        }
-      });
-
-      // Ground fades during transition
-      this.tweens.add({
-        targets: this.ground,
-        alpha: 0,
-        duration: duration * 0.4,
-        ease: "Cubic.easeIn",
-        onComplete: () => {
-          this.ground.setAlpha(1);
-        },
-      });
-
-      // Sky-colored overlay (celestial cream-white, matching ascension cloud floor)
-      transitionOverlay.setFillStyle(0xfff8e8, 1);
-      transitionOverlay.setPosition(GAME_WIDTH / 2, GAME_HEIGHT / 2);
-      transitionOverlay.setSize(GAME_WIDTH, GAME_HEIGHT);
-      transitionOverlay.setAlpha(0);
-      transitionOverlay.setDepth(50);
-
-      // Cloud wisps drifting during the sky transition
-      const cloudWisps: Phaser.GameObjects.Ellipse[] = [];
-      const cloudDirection = isEnteringAscension ? 1 : -1; // Down when flying up, up when descending
-
-      for (let i = 0; i < 7; i++) {
-        const w = Math.round((60 + Math.random() * 120) * SCALE);
-        const h = Math.round((15 + Math.random() * 25) * SCALE);
-        const startX = Math.random() * GAME_WIDTH;
-        const startY = Math.random() * GAME_HEIGHT;
-        const cloud = this.add.ellipse(
-          startX,
-          startY,
-          w,
-          h,
-          i % 3 === 0 ? 0xfff0c8 : 0xffffff, // Mix white + pale gold
-          0.4 + Math.random() * 0.3
-        );
-        cloud.setDepth(51);
-        cloud.setAlpha(0);
-        cloudWisps.push(cloud);
-
-        this.tweens.add({
-          targets: cloud,
-          alpha: 0.3 + Math.random() * 0.4,
-          y: startY + cloudDirection * Math.round((80 + Math.random() * 200) * SCALE),
-          x: startX + Math.round((Math.random() - 0.5) * 100 * SCALE),
-          duration: duration * 0.8,
-          ease: "Sine.easeInOut",
-          delay: Math.random() * 150,
-          onComplete: () => {
-            this.tweens.add({
-              targets: cloud,
-              alpha: 0,
-              duration: 200,
-              onComplete: () => cloud.destroy(),
-            });
-          },
-        });
-      }
-
-      // Main overlay fade
-      this.tweens.add({
-        targets: transitionOverlay,
-        alpha: 1,
-        duration: duration * 0.5,
-        ease: "Cubic.easeIn",
-        yoyo: true,
-        hold: duration * 0.15,
-        onComplete: () => {
-          transitionOverlay.destroy();
-          cloudWisps.forEach((c) => {
-            if (c.active) c.destroy();
-          });
-        },
-      });
-    } else {
-      // Standard horizontal slide
-      oldElementData.forEach(({ el }) => {
-        if ((el as any).x !== undefined) {
-          this.tweens.add({
-            targets: el,
-            x: (el as any).x + slideOutOffset,
-            duration,
-            ease: "Cubic.easeInOut",
-          });
-          // Slide character drop shadow with its sprite so it doesn't lag
-          const shadow = (el as any)._shadow as Phaser.GameObjects.Sprite | undefined;
-          if (shadow && shadow.active) {
-            this.tweens.add({
-              targets: shadow,
-              x: shadow.x + slideOutOffset,
-              duration,
-              ease: "Cubic.easeInOut",
-            });
-          }
-        }
-      });
-
-      // Slide ground texture overlay (scaled)
-      this.tweens.add({
-        targets: this.ground,
-        tilePositionX:
-          this.ground.tilePositionX +
-          (isGoingRight ? Math.round(100 * SCALE) : -Math.round(100 * SCALE)),
-        duration,
-        ease: "Cubic.easeInOut",
-      });
-
-      // Slide transition overlay in, destroy when complete
-      this.tweens.add({
-        targets: transitionOverlay,
-        x: GAME_WIDTH / 2,
-        duration,
-        ease: "Cubic.easeInOut",
-        onComplete: () => {
-          transitionOverlay.destroy();
-        },
-      });
-    }
-
-    // At 40% through animation, swap the zone for smooth visual transition
-    this.time.delayedCall(duration * 0.4, () => {
-      // Hide old zone elements (don't destroy - they're cached for reuse)
-      if (this.currentZone === "trending") {
-        this.trendingElements.forEach((el) => (el as any).setVisible(false));
-        this.billboardTexts.forEach((t) => t.setVisible(false));
-        if (this.tickerText) this.tickerText.setVisible(false);
-        this.skylineSprites.forEach((s) => s.setVisible(false));
-        // Stop ticker animation
-        if (this.tickerTimer) {
-          this.tickerTimer.destroy();
-          this.tickerTimer = null;
-        }
-        // Stop billboard update timer
-        if (this.billboardTimer) {
-          this.billboardTimer.destroy();
-          this.billboardTimer = null;
-        }
-        // Stop traffic timers
-        clearTrafficTimers(this);
-      } else if (this.currentZone === "ballers") {
-        this.ballersElements.forEach((el) => (el as any).setVisible(false));
-      } else if (this.currentZone === "founders") {
-        this.foundersElements.forEach((el) => (el as any).setVisible(false));
-      } else if (this.currentZone === "labs") {
-        this.labsElements.forEach((el) => (el as any).setVisible(false));
-      } else if (this.currentZone === "moltbook") {
-        this.moltbookElements.forEach((el) => (el as any).setVisible(false));
-      } else if (this.currentZone === "arena") {
-        this.arenaElements.forEach((el) => (el as any).setVisible(false));
-        disconnectArena(this);
-      } else if (this.currentZone === "ascension") {
-        this.ascensionElements.forEach((el) => (el as any).setVisible(false));
-        disconnectAscension(this);
-      }
-
-      // Update zone and set up new content
-      this.currentZone = newZone;
-
-      // Reset NPC greeting state on zone change
-      this.previousNearbyNPC = null;
-      this.npcGreetZoneEntryTime = Date.now();
-
-      // Sync zone to Zustand store (used by ImmersiveHUD)
-      window.dispatchEvent(
-        new CustomEvent("agencity-phaser-zone-change", { detail: { zone: newZone } })
-      );
-
-      // Change ground texture based on zone
-      const groundTextures: Record<ZoneType, string> = {
-        labs: "labs_ground", // Tech Labs has futuristic floor tiles
-        moltbook: "beach_ground", // Moltbook Beach has sand
-        main_city: "grass",
-        trending: "concrete",
-        ballers: "grass", // Ballers Valley has premium grass (luxury estate feel)
-        founders: "founders_ground", // Founder's Corner has warm workshop flooring
-        arena: "arena_floor", // MoltBook Arena has dark checkerboard floor
-        ascension: "ascension_cloud_ground", // Ascension Spire has bright cloud-tile floor
-      };
-      this.ground.setTexture(groundTextures[newZone]);
-
-      // Setup new zone content (will be positioned off-screen initially)
-      this.setupZoneOffscreen(newZone, slideInOffset);
-    });
-
-    // Clean up old elements after animation completes
-    this.time.delayedCall(duration + 50, () => {
-      oldElementData.forEach(({ el }) => {
-        // Only destroy elements that aren't persistent (zone elements are reused)
-        const isDecoration = this.decorations.includes(el as any);
-        const isAnimal = this.animals.some((a) => a.sprite === el);
-        const isTrendingElement =
-          this.trendingElements.includes(el) ||
-          this.skylineSprites.includes(el as any) ||
-          this.billboardTexts.includes(el as any) ||
-          el === this.tickerText;
-        const isBallersElement = this.ballersElements.includes(el);
-        const isFoundersElement = this.foundersElements.includes(el);
-        const isMoltbookElement = this.moltbookElements.includes(el);
-        const isLabsElement = this.labsElements.includes(el);
-        const isArenaElement = this.arenaElements.includes(el);
-        const isAscensionElement = this.ascensionElements.includes(el);
-
-        if (
-          !isDecoration &&
-          !isAnimal &&
-          !isTrendingElement &&
-          !isBallersElement &&
-          !isFoundersElement &&
-          !isMoltbookElement &&
-          !isLabsElement &&
-          !isArenaElement &&
-          !isAscensionElement &&
-          el &&
-          (el as any).destroy &&
-          (el as any).active !== false
-        ) {
-          (el as any).destroy();
-        }
-      });
-
-      // Only clear building/character sprites that existed at transition start
-      // Sprites created mid-transition by worldState updates are preserved
-      oldBuildingSpriteIds.forEach((id) => {
-        const sprite = this.buildingSprites.get(id);
-        if (sprite && (sprite as any).active !== false) {
-          (sprite as any).destroy();
-        }
-        this.buildingSprites.delete(id);
-      });
-      oldCharacterSpriteIds.forEach((id) => {
-        const sprite = this.characterSprites.get(id);
-        if (sprite && (sprite as any).active !== false) {
-          // Destroy attached drop shadow before the sprite itself
-          const shadow = (sprite as any)._shadow as Phaser.GameObjects.Sprite | undefined;
-          if (shadow) {
-            shadow.destroy();
-            (sprite as any)._shadow = null;
-          }
-          (sprite as any).destroy();
-        }
-        this.characterSprites.delete(id);
-      });
-
-      // CRITICAL: Immediately recreate sprites from existing worldState
-      // Without this, sprites stay destroyed until next React Query poll (up to 60s)
-      if (this.worldState) {
-        this.updateCharacters(this.worldState.population);
-        this.buildingSystem.updateBuildings(this.worldState.buildings);
-      }
-
-      // Mark transition complete
-      this.isTransitioning = false;
-
-      // Resume camera follow after transition
-      if (this.cameraFollowing && this.localPlayer) {
-        this.cameras.main.startFollow(this.localPlayer, true, 0.08, 0.08);
-        this.cameras.main.setDeadzone(30, 15);
-      }
-
-      // Flush any pending player spawn that was queued during this transition
-      if (this.pendingEnterWorld) {
-        const pending = this.pendingEnterWorld;
-        this.pendingEnterWorld = null;
-        pending();
-      }
-
-      // Show helper NPC only when the player is back in the city
-      if (this.helperNPC) {
-        const inCity = this.currentZone === "main_city";
-        this.helperNPC.setVisible(inCity);
-        const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
-        if (indicator) indicator.setVisible(inCity);
-      }
-    });
-  }
-
-  private setupZoneOffscreen(zone: ZoneType, offsetX: number): void {
-    // Hide all zone elements once, before setting up the new zone
-    this.hideAllZoneElements();
-
-    // Ensure ground is visible by default (zones that need it hidden will override)
-    this.ground.setVisible(true);
-    if (this.groundPath) this.groundPath.setVisible(true);
-    if (this.groundTransition) this.groundTransition.setVisible(true);
-
-    // Setup zone with elements offset, then animate them into position
-    const duration = 400; // Smooth slide-in matching the overall transition feel
-
-    if (zone === "trending") {
-      setupTrendingZone(this);
-
-      // Offset all new Catalog elements and animate them in
-      const newElements = [
-        ...this.trendingElements,
-        ...this.billboardTexts,
-        this.tickerText,
-        ...this.skylineSprites,
-      ].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).x !== undefined) {
-          const targetX = (el as any).x;
-          (el as any).x = targetX + offsetX;
-          this.tweens.add({
-            targets: el,
-            x: targetX,
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    } else if (zone === "ballers") {
-      setupBallersZone(this);
-
-      // Offset all new Ballers Valley elements and animate them in
-      const newElements = [...this.ballersElements].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).x !== undefined) {
-          const targetX = (el as any).x;
-          (el as any).x = targetX + offsetX;
-          this.tweens.add({
-            targets: el,
-            x: targetX,
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    } else if (zone === "founders") {
-      setupFoundersZone(this);
-
-      // Offset all new Founder's Corner elements and animate them in
-      const newElements = [...this.foundersElements].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).x !== undefined) {
-          const targetX = (el as any).x;
-          (el as any).x = targetX + offsetX;
-          this.tweens.add({
-            targets: el,
-            x: targetX,
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    } else if (zone === "labs") {
-      setupLabsZone(this);
-
-      // Offset all new Tech Labs elements and animate them in
-      const newElements = [...this.labsElements].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).x !== undefined) {
-          const targetX = (el as any).x;
-          (el as any).x = targetX + offsetX;
-          this.tweens.add({
-            targets: el,
-            x: targetX,
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    } else if (zone === "moltbook") {
-      setupMoltbookZone(this);
-
-      // Offset all new Moltbook Beach elements and animate them in
-      const newElements = [...this.moltbookElements].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).x !== undefined) {
-          const targetX = (el as any).x;
-          (el as any).x = targetX + offsetX;
-          this.tweens.add({
-            targets: el,
-            x: targetX,
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    } else if (zone === "arena") {
-      setupArenaZone(this);
-
-      // Offset all new Arena elements and animate them in
-      const newElements = [...this.arenaElements].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).x !== undefined) {
-          const targetX = (el as any).x;
-          (el as any).x = targetX + offsetX;
-          this.tweens.add({
-            targets: el,
-            x: targetX,
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    } else if (zone === "ascension") {
-      setupAscensionZone(this);
-
-      // Ascension elements rise from below (upward float-in)
-      const verticalDist = Math.round(300 * SCALE);
-      const newElements = [...this.ascensionElements].filter(Boolean);
-
-      newElements.forEach((el) => {
-        if ((el as any).y !== undefined) {
-          const targetY = (el as any).y;
-          (el as any).y = targetY + verticalDist;
-          (el as any).alpha = 0;
-          this.tweens.add({
-            targets: el,
-            y: targetY,
-            alpha: 1,
-            duration: 600,
-            ease: "Cubic.easeOut",
-            delay: Math.random() * 200,
-          });
-        }
-      });
-    } else {
-      setupMainCityZone(this);
-
-      // Animate Park elements in using their ORIGINAL positions
-      const newElements = [...this.decorations, ...this.animals.map((a) => a.sprite)];
-
-      newElements.forEach((el) => {
-        // Get the original position, not the current (off-screen) position
-        const originalX = this.originalPositions.get(el);
-        if (originalX !== undefined) {
-          (el as any).x = originalX + offsetX; // Start off-screen
-          this.tweens.add({
-            targets: el,
-            x: originalX, // Animate to original position
-            duration,
-            ease: "Cubic.easeOut",
-          });
-        }
-      });
-    }
-  }
-
-  private storeOriginalPositions(): void {
-    // Store original X positions of decorations and animals for zone transitions
-    this.decorations.forEach((d) => {
-      this.originalPositions.set(d, (d as any).x || 0);
-    });
-    this.animals.forEach((a) => {
-      this.originalPositions.set(a.sprite, (a.sprite as any).x || 0);
-    });
-  }
-
-  /**
-   * Store original X positions for zone elements that participate in slide animations.
-   * Called after zone elements are first created so positions can be restored
-   * before the next slide-out/slide-in cycle.
-   */
-  public storeZoneElementPositions(elements: Phaser.GameObjects.GameObject[]): void {
-    elements.forEach((el) => {
-      if ((el as any).x !== undefined) {
-        this.originalPositions.set(el, (el as any).x);
-      }
-    });
-  }
-
-  /**
-   * Reset zone elements to their original X positions (counteracts slide-out corruption).
-   */
-  private resetZoneElementPositions(elements: Phaser.GameObjects.GameObject[]): void {
-    elements.forEach((el) => {
-      const origX = this.originalPositions.get(el);
-      if (origX !== undefined) (el as any).x = origX;
-    });
-  }
-
-  private clearCurrentZone(): void {
-    // Clear zone-specific elements based on current zone
-    if (this.currentZone === "trending") {
-      // Just hide elements instead of destroying (they're cached for reuse)
-      this.trendingElements.forEach((el) => (el as any).setVisible(false));
-      this.billboardTexts.forEach((t) => t.setVisible(false));
-      if (this.tickerText) {
-        this.tickerText.setVisible(false);
-      }
-      if (this.tickerTimer) {
-        this.tickerTimer.destroy();
-        this.tickerTimer = null;
-      }
-      this.skylineSprites.forEach((s) => s.setVisible(false));
-    } else if (this.currentZone === "ballers") {
-      // Hide ballers elements
-      this.ballersElements.forEach((el) => (el as any).setVisible(false));
-    } else if (this.currentZone === "founders") {
-      // Hide founders elements
-      this.foundersElements.forEach((el) => (el as any).setVisible(false));
-    } else if (this.currentZone === "labs") {
-      // Hide labs elements
-      this.labsElements.forEach((el) => (el as any).setVisible(false));
-    } else if (this.currentZone === "arena") {
-      // Hide arena elements and disconnect WebSocket
-      this.arenaElements.forEach((el) => (el as any).setVisible(false));
-      disconnectArena(this);
-    } else if (this.currentZone === "ascension") {
-      // Hide ascension elements and stop polling
-      this.ascensionElements.forEach((el) => (el as any).setVisible(false));
-      disconnectAscension(this);
-    } else if (this.currentZone === "main_city") {
-      // Main city uses shared decorations, don't destroy them
-      // Just hide them
-      this.decorations.forEach((d) => d.setVisible(false));
-      this.animals.forEach((a) => a.sprite.setVisible(false));
-      if (this.helperNPC) {
-        this.helperNPC.setVisible(false);
-        const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
-        if (indicator) indicator.setVisible(false);
-      }
-    }
-
-    // Reset ground
-    if (this.zoneGround) {
-      this.zoneGround.destroy();
-      this.zoneGround = null;
-    }
-    if (this.zonePath) {
-      this.zonePath.destroy();
-      this.zonePath = null;
-    }
-  }
-
-  /**
-   * Hide all zone-specific elements in a single pass.
-   * Called once before setting up a new zone, replacing the duplicated
-   * hide-everything blocks that were copied into each setup method.
-   */
-  private hideAllZoneElements(): void {
-    this.decorations.forEach((d) => d.setVisible(false));
-    this.animals.forEach((a) => a.sprite.setVisible(false));
-    if (this.fountainWater) this.fountainWater.setVisible(false);
-    this.trendingElements.forEach((el) => (el as any).setVisible(false));
-    this.skylineSprites.forEach((s) => s.setVisible(false));
-    this.billboardTexts.forEach((t) => t.setVisible(false));
-    if (this.tickerText) this.tickerText.setVisible(false);
-    this.academyElements.forEach((el) => (el as any).setVisible(false));
-    this.academyBuildings.forEach((s) => s.setVisible(false));
-    this.ballersElements.forEach((el) => (el as any).setVisible(false));
-    this.foundersElements.forEach((el) => (el as any).setVisible(false));
-    this.labsElements.forEach((el) => (el as any).setVisible(false));
-    this.moltbookElements.forEach((el) => (el as any).setVisible(false));
-    this.arenaElements.forEach((el) => (el as any).setVisible(false));
-    this.ascensionElements.forEach((el) => (el as any).setVisible(false));
-    disconnectArena(this);
-    disconnectAscension(this);
-    if (this.helperNPC) {
-      this.helperNPC.setVisible(false);
-      const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
-      if (indicator) indicator.setVisible(false);
-    }
-    if (this.foundersPopup) {
-      this.foundersPopup.destroy();
-      this.foundersPopup = null;
-    }
-  }
-
-  private setupZone(zone: ZoneType): void {
-    switch (zone) {
-      case "labs":
-        setupLabsZone(this);
-        break;
-      case "moltbook":
-        setupMoltbookZone(this);
-        break;
-      case "trending":
-        setupTrendingZone(this);
-        break;
-      case "ballers":
-        setupBallersZone(this);
-        break;
-      case "founders":
-        setupFoundersZone(this);
-        break;
-      case "arena":
-        setupArenaZone(this);
-        break;
-      case "ascension":
-        setupAscensionZone(this);
-        break;
-      case "main_city":
-      default:
-        setupMainCityZone(this);
-        break;
-    }
-  }
-
-  // Handle AI behavior commands for characters
-  // Find a character sprite by character ID (handles special character naming)
   public findCharacterSprite(characterId: string): Phaser.GameObjects.Sprite | null {
     // Direct lookup
     const direct = this.characterSprites.get(characterId);
@@ -2862,28 +2112,6 @@ export class WorldScene extends Phaser.Scene {
   // Handle character speak events (from AI behavior)
   // Cleanup method to prevent memory leaks
   // === AGENT SERVER WEBSOCKET ===
-
-  registerZonePopupBuilding(
-    id: string,
-    sprite: Phaser.GameObjects.Sprite,
-    data: GameBuilding,
-    zone: ZoneType,
-    onInteract: () => void
-  ): void {
-    this.zonePopupBuildings.set(id, { sprite, data, zone, onInteract });
-  }
-
-  unregisterZonePopupBuilding(id: string): void {
-    this.zonePopupBuildings.delete(id);
-  }
-
-  unregisterZonePopupBuildingsByZone(zone: ZoneType): void {
-    for (const [id, entry] of this.zonePopupBuildings) {
-      if (entry.zone === zone) {
-        this.zonePopupBuildings.delete(id);
-      }
-    }
-  }
 
   private cleanup(): void {
     // Clean up tutorial
@@ -3203,7 +2431,7 @@ export class WorldScene extends Phaser.Scene {
     }
   }
 
-  private updateCharacters(characters: GameCharacter[]): void {
+  public updateCharacters(characters: GameCharacter[]): void {
     // Performance: rebuild character lookup map for O(1) access in update()
     this.characterById.clear();
     characters.forEach((c) => this.characterById.set(c.id, c));
