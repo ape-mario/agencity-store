@@ -1,0 +1,566 @@
+@import "tailwindcss";
+
+@theme {
+  --color-city-green: #4ade80;
+  --color-city-gold: #fbbf24;
+  --color-city-dark: #0a0a0f;
+  --color-city-darker: #050508;
+  --color-city-red: #f87171;
+  --font-pixel: "Press Start 2P", monospace;
+}
+
+/*
+ * The AgenC theme tokens (`--agenc-*`) are imported as a side-effect from
+ * `@tetsuo-ai/marketplace-react/theme.css` in `Providers` — branding overrides
+ * from `agenc.config.ts` are projected onto these same custom properties by
+ * `<StoreShell>`. Keep page-level styling to layout only; the protocol
+ * components carry their own themed styles.
+ */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+  overflow-x: hidden;
+  overscroll-behavior: none;
+  background: var(--agenc-void, #0a0612);
+  color: var(--agenc-text, #f5f0ff);
+  font-family:
+    var(
+      --agenc-font,
+      ui-sans-serif,
+      system-ui,
+      -apple-system,
+      "Segoe UI",
+      Roboto,
+      sans-serif
+    );
+}
+
+a {
+  color: inherit;
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * AgenCity custom UI layer
+ * Dark theme, violet accent (#7C3AED). These are layout/presentation styles for
+ * store-specific surfaces (wallet button, catalog, proof, warnings). The
+ * protocol components (ListingDetailSection, EarningsSection, …) carry their
+ * own themed styles via marketplace-react/components.css.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Shared layout knobs (mirror the theme tokens with AgenCity overrides). */
+.agenc-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--agenc-text-muted, #b8a8d9);
+}
+.agenc-spin {
+  animation: agenc-spin 0.8s linear infinite;
+}
+@keyframes agenc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Wallet connect button (header, top-right) */
+.agenc-wallet-slot {
+  position: fixed;
+  top: 0.9rem;
+  right: 1.2rem;
+  z-index: 50;
+}
+.agenc-wallet-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.95rem;
+  border-radius: 999px;
+  border: 1px solid var(--agenc-violet, #7c3aed);
+  background: var(--agenc-violet, #7c3aed);
+  color: #fff;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+.agenc-wallet-btn:hover {
+  filter: brightness(1.1);
+}
+.agenc-wallet-btn:disabled {
+  opacity: 0.7;
+  cursor: progress;
+}
+.agenc-wallet-btn--connected {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.5);
+  color: #6ee7b7;
+}
+.agenc-wallet-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+}
+.agenc-wallet-phantom-glyph {
+  font-size: 1rem;
+  line-height: 1;
+}
+.agenc-wallet-addr {
+  font-variant-numeric: tabular-nums;
+}
+.agenc-wallet-state {
+  font-size: 0.72rem;
+  opacity: 0.8;
+}
+@media (max-width: 640px) {
+  .agenc-wallet-state {
+    display: none;
+  }
+}
+
+/* Wallet modal re-theme (Phantom-first, no-private-keys assurance) */
+.wallet-adapter-modal-wrapper {
+  background: rgba(11, 7, 23, 0.92) !important;
+}
+.wallet-adapter-modal-wrapper::before {
+  content: "Phantom recommended";
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #a78bfa;
+  margin-bottom: 0.5rem;
+}
+.wallet-adapter-modal-wrapper::after {
+  content: "Secure wallet prompt. No private keys leave your wallet.";
+  display: block;
+  font-size: 0.72rem;
+  color: var(--agenc-text-muted, #b8a8d9);
+  margin-top: 0.75rem;
+}
+.wallet-adapter-button {
+  background: var(--agenc-surface, #16102a) !important;
+  font-family: inherit !important;
+}
+.wallet-adapter-modal-list-more {
+  color: var(--agenc-text-muted, #b8a8d9) !important;
+}
+
+/* Listing detail: hire warning + referrer disclosure */
+.agenc-detail-wrap {
+  display: grid;
+  gap: 0.75rem;
+}
+.agenc-warn {
+  display: flex;
+  gap: 0.65rem;
+  align-items: flex-start;
+  padding: 0.7rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.86rem;
+  line-height: 1.45;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.08);
+  color: #fcd34d;
+}
+.agenc-warn--info {
+  border-color: rgba(124, 58, 237, 0.4);
+  background: rgba(124, 58, 237, 0.1);
+  color: #c4b5fd;
+}
+.agenc-warn-icon {
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
+.agenc-warn-mono {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.8rem;
+}
+
+/* Catalog: hero + market panel */
+.agenc-catalog {
+  display: grid;
+  gap: 1.25rem;
+}
+.agenc-hero {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 1.5rem;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(124, 58, 237, 0.18), rgba(91, 33, 182, 0.08));
+  border: 1px solid rgba(124, 58, 237, 0.3);
+}
+.agenc-market-panel {
+  display: grid;
+  gap: 0.15rem;
+  padding: 1rem 1.4rem;
+  border-radius: 12px;
+  background: rgba(11, 7, 23, 0.6);
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  text-align: right;
+  position: relative;
+}
+.agenc-market-dot {
+  position: absolute;
+  top: 0.8rem;
+  right: 1.4rem;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+  animation: agenc-pulse 2s ease-in-out infinite;
+}
+@keyframes agenc-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+.agenc-market-panel strong {
+  font-size: 1.6rem;
+  display: block;
+  line-height: 1.1;
+}
+.agenc-market-panel span {
+  font-size: 0.78rem;
+  color: var(--agenc-text-muted, #b8a8d9);
+}
+.agenc-market-foot {
+  margin: 0.35rem 0 0;
+  font-size: 0.68rem;
+  opacity: 0.7;
+}
+@media (max-width: 760px) {
+  .agenc-hero {
+    justify-content: flex-start;
+  }
+  .agenc-market-panel {
+    text-align: left;
+    width: 100%;
+  }
+}
+
+/* Featured rail */
+.agenc-featured h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 1rem;
+  margin: 0 0 0.6rem;
+  color: var(--agenc-text, #f5f0ff);
+}
+.agenc-featured-rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+.agenc-featured-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem;
+  border-radius: 12px;
+  background: var(--agenc-surface, #16102a);
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  transition: border-color 0.15s ease;
+}
+.agenc-featured-card:hover {
+  border-color: var(--agenc-violet, #7c3aed);
+}
+.agenc-featured-card strong {
+  display: block;
+  font-size: 0.9rem;
+}
+.agenc-featured-card span {
+  font-size: 0.78rem;
+  color: var(--agenc-text-muted, #b8a8d9);
+}
+
+/* Search + chips */
+.agenc-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+}
+.agenc-search {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  background: var(--agenc-surface, #16102a);
+  color: var(--agenc-text-muted, #b8a8d9);
+  min-width: 240px;
+  flex: 1;
+  max-width: 30rem;
+}
+.agenc-search input {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--agenc-text, #f5f0ff);
+  font-size: 0.9rem;
+  width: 100%;
+  font-family: inherit;
+}
+.agenc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.agenc-chip {
+  padding: 0.35rem 0.85rem;
+  border-radius: 999px;
+  cursor: pointer;
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  background: transparent;
+  color: var(--agenc-text-muted, #b8a8d9);
+  font-size: 0.82rem;
+  font-family: inherit;
+}
+.agenc-chip--active {
+  border-color: var(--agenc-violet, #7c3aed);
+  background: var(--agenc-violet, #7c3aed);
+  color: #fff;
+}
+.agenc-result-count {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--agenc-text-muted, #b8a8d9);
+}
+
+/* Listing cards grid */
+.agenc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+.agenc-card {
+  display: flex;
+  flex-direction: column;
+  border-radius: 14px;
+  background: var(--agenc-surface, #16102a);
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  overflow: hidden;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+.agenc-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--agenc-violet, #7c3aed);
+}
+.agenc-card-body {
+  padding: 0.9rem 1rem 0.5rem;
+  display: grid;
+  gap: 0.3rem;
+}
+.agenc-card-badges {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.agenc-tag {
+  font-size: 0.66rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.agenc-tag--available {
+  background: rgba(16, 185, 129, 0.15);
+  color: #6ee7b7;
+}
+.agenc-tag--popular {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fcd34d;
+}
+.agenc-tag--verified {
+  background: rgba(59, 130, 246, 0.15);
+  color: #93c5fd;
+}
+.agenc-card-body h3 {
+  margin: 0.1rem 0 0;
+  font-size: 1rem;
+  line-height: 1.2;
+}
+.agenc-card-provider {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--agenc-text-muted, #b8a8d9);
+}
+.agenc-card-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-top: 0.35rem;
+}
+.agenc-card-price {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--agenc-text, #f5f0ff);
+}
+.agenc-card-hires {
+  font-size: 0.74rem;
+  color: var(--agenc-text-muted, #b8a8d9);
+}
+.agenc-card-cta {
+  margin: 0.6rem 0.9rem 0.9rem;
+  padding: 0.5rem 0.8rem;
+  border-radius: 8px;
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  background: rgba(124, 58, 237, 0.12);
+  color: #c4b5fd;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  justify-content: center;
+  font-family: inherit;
+}
+.agenc-card-cta:hover {
+  background: rgba(124, 58, 237, 0.22);
+}
+
+/* Listing thumbnail (generated category visual) */
+.agenc-thumb {
+  position: relative;
+  height: 110px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.agenc-thumb-icon {
+  color: rgba(255, 255, 255, 0.9);
+  z-index: 1;
+}
+.agenc-thumb-initials {
+  position: absolute;
+  bottom: 0.5rem;
+  right: 0.7rem;
+  font-size: 1.4rem;
+  font-weight: 800;
+  color: rgba(255, 255, 255, 0.16);
+  letter-spacing: 0.05em;
+}
+.agenc-thumb-pattern {
+  position: absolute;
+  inset: 0;
+  opacity: 0.18;
+}
+.agenc-thumb-pattern--grid {
+  background-image: linear-gradient(rgba(255, 255, 255, 0.5) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.5) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+.agenc-thumb-pattern--orbit {
+  background: radial-gradient(circle at 50% 50%, transparent 30%, rgba(255, 255, 255, 0.4) 31%, transparent 33%),
+    radial-gradient(circle at 50% 50%, transparent 55%, rgba(255, 255, 255, 0.3) 56%, transparent 58%);
+}
+.agenc-thumb-pattern--rays {
+  background: repeating-conic-gradient(rgba(255, 255, 255, 0.4) 0deg 6deg, transparent 6deg 24deg);
+}
+.agenc-thumb-pattern--stack {
+  background: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.35) 0 2px, transparent 2px 14px);
+}
+
+/* Info pages (/proof, /trust) shared layout */
+.info-page {
+  display: grid;
+  gap: 1.25rem;
+  max-width: 920px;
+  margin: 0 auto;
+}
+.info-hero h1 {
+  font-size: 1.7rem;
+  margin: 0.4rem 0;
+  line-height: 1.15;
+}
+.info-hero p {
+  margin: 0;
+  color: var(--agenc-text-muted, #b8a8d9);
+  font-size: 0.92rem;
+}
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.9rem;
+}
+.info-card {
+  padding: 1rem 1.1rem;
+  border-radius: 12px;
+  background: var(--agenc-surface, #16102a);
+  border: 1px solid var(--agenc-border, #2e1a4a);
+}
+.info-card h2 {
+  margin: 0 0 0.4rem;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--agenc-text-muted, #b8a8d9);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.info-card p {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+/* Proof page specifics */
+.proof-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.proof-pill--ok {
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+.proof-pill--err {
+  background: rgba(239, 68, 68, 0.12);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+.proof-mono {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.82rem;
+  word-break: break-all;
+}
+.proof-error,
+.proof-cli {
+  grid-column: 1 / -1;
+}
+.proof-cli pre,
+.proof-error pre {
+  margin: 0.6rem 0 0;
+  padding: 0.9rem;
+  border-radius: 8px;
+  background: rgba(11, 7, 23, 0.7);
+  border: 1px solid var(--agenc-border, #2e1a4a);
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+

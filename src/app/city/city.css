@@ -1,0 +1,195 @@
+/* Scoped AgenCity city styles for AgenCity / Tailwind 4 */
+
+.city-page {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  width: 100dvw;
+  height: 100vh;
+  height: 100dvh;
+  max-width: 100vw;
+  max-width: 100dvw;
+  max-height: 100vh;
+  max-height: 100dvh;
+  overflow: hidden;
+  background: linear-gradient(180deg, #1a1a2e 0%, #0f0f1a 100%);
+  color: #fff;
+  font-family: var(--font-pixel), "Press Start 2P", monospace;
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.city-page * {
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: crisp-edges;
+}
+
+.city-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.city-loader {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(180deg, #1a1a2e 0%, #0f0f1a 100%);
+}
+
+.city-loader-text {
+  font-family: var(--font-pixel), "Press Start 2P", monospace;
+  font-size: 0.75rem;
+  color: #4ade80;
+  animation: city-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes city-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Minimal HUD primitives */
+.city-page .hud-panel {
+  background: rgba(10, 10, 15, 0.92);
+  border: 2px solid #4ade80;
+  box-shadow: 0 0 12px rgba(74, 222, 128, 0.25);
+}
+
+.city-page .btn-retro {
+  padding: 0.5rem 1rem;
+  background: #4ade80;
+  color: #0a0a0f;
+  font-family: var(--font-pixel), "Press Start 2P", monospace;
+  font-size: 0.625rem;
+  line-height: 1.5;
+  box-shadow:
+    4px 4px 0 #166534,
+    inset -2px -2px 0 rgba(0, 0, 0, 0.2),
+    inset 2px 2px 0 rgba(255, 255, 255, 0.2);
+  transition: all 0.1s;
+}
+
+.city-page .btn-retro:hover {
+  transform: translate(2px, 2px);
+  box-shadow:
+    2px 2px 0 #166534,
+    inset -2px -2px 0 rgba(0, 0, 0, 0.2),
+    inset 2px 2px 0 rgba(255, 255, 255, 0.2);
+}
+
+.city-page .btn-retro:active {
+  transform: translate(4px, 4px);
+  box-shadow: none;
+}
+
+/* Scrollbar */
+.city-page ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.city-page ::-webkit-scrollbar-track {
+  background: #050508;
+}
+
+.city-page ::-webkit-scrollbar-thumb {
+  background: #4ade80;
+}
+
+/* Header / Footer shell */
+.city-page .city-header {
+  background: rgba(10, 10, 15, 0.95);
+  border-bottom: 2px solid #4ade80;
+  box-shadow: 0 0 16px rgba(74, 222, 128, 0.15);
+}
+
+.city-page .city-footer {
+  background: rgba(10, 10, 15, 0.95);
+  border-top: 2px solid #4ade80;
+  box-shadow: 0 0 16px rgba(74, 222, 128, 0.15);
+}
+
+/* Health bar */
+.city-page .health-bar {
+  height: 14px;
+  background: #1a1a2e;
+  border: 2px solid #4ade80;
+  position: relative;
+  overflow: hidden;
+}
+
+.city-page .health-bar-fill {
+  height: 100%;
+  transition: width 0.5s ease-out;
+  background: linear-gradient(90deg, #4ade80 0%, #22c55e 100%);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.5);
+}
+
+/* Pixel border (decorative) */
+.city-page .pixel-border {
+  border: 4px solid;
+  border-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='6'%3E%3Crect width='2' height='2' fill='%234ade80'/%3E%3Crect x='2' width='2' height='2' fill='%234ade80'/%3E%3Crect x='4' width='2' height='2' fill='%234ade80'/%3E%3Crect y='2' width='2' height='2' fill='%234ade80'/%3E%3Crect x='4' y='2' width='2' height='2' fill='%234ade80'/%3E%3Crect y='4' width='2' height='2' fill='%234ade80'/%3E%3Crect x='2' y='4' width='2' height='2' fill='%234ade80'/%3E%3Crect x='4' y='4' width='2' height='2' fill='%234ade80'/%3E%3C/svg%3E") 2 stretch;
+}
+
+/* CRT scanlines */
+.city-page .scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.15) 0px,
+    rgba(0, 0, 0, 0.15) 1px,
+    transparent 1px,
+    transparent 2px
+  );
+  opacity: 0.35;
+  z-index: 5;
+}
+
+/* Glow line divider */
+.city-page .glow-line-h {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #4ade80, transparent);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.4);
+}
+
+/* Safe area helpers */
+.city-page .safe-area-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+.city-page .safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Hide scrollbar for nav strip */
+.city-page .scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.city-page .scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Phaser canvas centering: ensure the game stays centered on wide screens */
+.city-page canvas {
+  position: absolute !important;
+  inset: 0 !important;
+  margin: auto !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
+}
+
+/* Phaser parent wrapper */
+.city-page .game-canvas-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}

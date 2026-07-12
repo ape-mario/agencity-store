@@ -1,0 +1,10295 @@
+import * as Phaser from "phaser";
+import type {
+  WorldState,
+  GameCharacter,
+  GameBuilding,
+  ZoneType,
+  BuildingStatus,
+} from "@/city/lib/types";
+import { ECOSYSTEM_CONFIG } from "@/city/lib/config";
+import { extractBattleTextures } from "@/city/lib/texture-bridge";
+import { SpeechBubbleManager } from "@/city/lib/speech-bubble-manager";
+import type { DialogueLine } from "@/city/lib/autonomous-dialogue";
+import { getCurrentLine, getActiveConversation } from "@/city/lib/autonomous-dialogue";
+import { useGameStore } from "@/city/lib/store";
+import { SCALE, DEPTH, Y } from "../textures/constants";
+import {
+  setupTrendingZone,
+  clearTrafficTimers,
+  setupBallersZone,
+  setupFoundersZone,
+  setupLabsZone,
+  setupMoltbookZone,
+  setupArenaZone,
+  disconnectArena,
+  setupAscensionZone,
+  disconnectAscension,
+  setupMainCityZone,
+} from "../zones";
+const GAME_WIDTH = 1280;
+const GAME_HEIGHT = 960;
+
+/** All character glow sprite property keys — single source of truth */
+const GLOW_KEYS = [
+  "tolyGlow",
+  "ashGlow",
+  "finnGlow",
+  "devGlow",
+  "scoutGlow",
+  "cjGlow",
+  "shawGlow",
+  "ramoGlow",
+  "sincaraGlow",
+  "stuuGlow",
+  "samGlow",
+  "alaaGlow",
+  "carloGlow",
+  "bnnGlow",
+  "professorOakGlow",
+  "citybotGlow",
+  "openClawGlow",
+] as const;
+
+interface Animal {
+  sprite: Phaser.GameObjects.Sprite;
+  type: "dog" | "cat" | "bird" | "butterfly" | "squirrel";
+  targetX: number;
+  speed: number;
+  direction: "left" | "right";
+  idleTimer: number;
+  isIdle: boolean;
+}
+
+interface Pokemon {
+  sprite: Phaser.GameObjects.Sprite;
+  type: "charmander" | "squirtle" | "bulbasaur";
+  targetX: number;
+  speed: number;
+  direction: "left" | "right";
+  idleTimer: number;
+  isIdle: boolean;
+  baseY: number; // Store base Y position for this Pokemon
+}
+
+// Beach crabs/lobsters - external agents that wander MoltBeach
+interface BeachCrab {
+  characterId: string;
+  sprite: Phaser.GameObjects.Sprite;
+  targetX: number;
+  speed: number;
+  direction: "left" | "right";
+  idleTimer: number;
+  isIdle: boolean;
+  baseY: number;
+  isLobster: boolean; // Moltbook agents are lobsters, others are crabs
+}
+
+export class WorldScene extends Phaser.Scene {
+  public worldState: WorldState | null = null;
+  private characterSprites: Map<string, Phaser.GameObjects.Sprite> = new Map();
+  private characterVariants: Map<string, number> = new Map(); // Store which variant each character uses
+  private buildingSprites: Map<string, Phaser.GameObjects.Container> = new Map();
+  private buildingById: Map<string, GameBuilding> = new Map(); // O(1) lookup for proximity checks
+  private buildingInitialized: Set<string> = new Set(); // Track which buildings have been created
+
+  // Zone-specific popup buildings (HQ, Arcade, Proof Hall, Earnings Hall, Trust Hall).
+  // These are not part of worldState.buildings, so they need a separate registry for
+  // E-key / proximity interaction to work reliably.
+  public zonePopupBuildings: Map<
+    string,
+    {
+      sprite: Phaser.GameObjects.Sprite;
+      data: GameBuilding;
+      zone: ZoneType;
+      onInteract: () => void;
+    }
+  > = new Map();
+  private weatherEmitter: Phaser.GameObjects.Particles.ParticleEmitter | null = null;
+  private clouds: Phaser.GameObjects.Sprite[] = [];
+  public decorations: Phaser.GameObjects.Sprite[] = [];
+  public animals: Animal[] = [];
+  public pokemon: Pokemon[] = []; // Pokemon in Founders zone
+  public beachCrabs: BeachCrab[] = []; // External agents wandering MoltBeach
+  public ambientCreatures: BeachCrab[] = []; // Ambient crabs/lobsters/hermit crabs (always present)
+  public fountainWater: Phaser.GameObjects.Particles.ParticleEmitter | null = null;
+  public ground!: Phaser.GameObjects.TileSprite;
+  public groundPath!: Phaser.GameObjects.TileSprite;
+  public groundTransition!: Phaser.GameObjects.Graphics;
+  private timeOfDay = 0;
+  private overlay!: Phaser.GameObjects.Rectangle;
+  private sunSprite: Phaser.GameObjects.Sprite | null = null;
+  private sunRays: Phaser.GameObjects.Graphics | null = null;
+  private fireflies: Phaser.GameObjects.Particles.ParticleEmitter | null = null;
+  private ambientParticles: Phaser.GameObjects.Particles.ParticleEmitter | null = null;
+  public skyGradient: Phaser.GameObjects.Graphics | null = null;
+  public stars: Phaser.GameObjects.Rectangle[] = [];
+  public skyClouds: Phaser.GameObjects.Ellipse[] = [];
+  public treeline: Phaser.GameObjects.Graphics | null = null;
+  private skyTimeState: "day" | "night" | "dusk" | "dawn" = "night";
+  private musicPlaying = false;
+  public audioContext: AudioContext | null = null;
+  public gainNode: GainNode | null = null;
+  private musicInterval: number | null = null;
+  private activeOscillators: OscillatorNode[] = []; // Track active oscillators to stop on track switch
+  private currentTrack = 0;
+  private trackNames = [
+    "Adventure",
+    "Bags Anthem",
+    "Night Market",
+    "Victory March",
+    "Route 101",
+    "Pokemon Center",
+    "Mystery Dungeon",
+  ];
+
+  // Store bound event handlers for cleanup
+  private boundToggleMusic: (() => void) | null = null;
+  private boundSkipTrack: (() => void) | null = null;
+  private boundPrevTrack: (() => void) | null = null;
+  private boundBotEffect: ((e: Event) => void) | null = null;
+  private boundBotAnimal: ((e: Event) => void) | null = null;
+  private boundBotPokemon: ((e: Event) => void) | null = null;
+
+  // Announcement text object
+  private announcementText: Phaser.GameObjects.Text | null = null;
+  private announcementBg: Phaser.GameObjects.Rectangle | null = null;
+
+  // Zone system
+  public currentZone: ZoneType = "main_city";
+  private isTransitioning = false; // Prevent overlapping transitions
+  public trendingElements: Phaser.GameObjects.GameObject[] = [];
+  private mainCityElements: Phaser.GameObjects.GameObject[] = [];
+  private academyElements: Phaser.GameObjects.GameObject[] = []; // Academy zone elements
+  public ballersElements: Phaser.GameObjects.GameObject[] = []; // Ballers Valley zone elements
+  public foundersElements: Phaser.GameObjects.GameObject[] = []; // Founder's Corner zone elements
+  public labsElements: Phaser.GameObjects.GameObject[] = []; // Tech Labs zone elements
+  public moltbookElements: Phaser.GameObjects.GameObject[] = []; // Moltbook Beach zone elements
+  public trendingZoneCreated = false; // Cache trending zone elements
+  private academyZoneCreated = false; // Cache academy zone elements
+  public ballersZoneCreated = false; // Cache ballers zone elements
+  public foundersZoneCreated = false; // Cache founders zone elements
+  public labsZoneCreated = false; // Cache labs zone elements
+  public moltbookZoneCreated = false; // Cache moltbook zone elements
+  public arenaElements: Phaser.GameObjects.GameObject[] = []; // Arena zone elements
+  public arenaZoneCreated = false; // Cache arena zone elements
+  public arenaPollingTimer: Phaser.Time.TimerEvent | null = null; // Polling/replay timer
+  public arenaReplayCleanup: (() => void) | null = null; // Replay event listener cleanup
+  private lightningTimer: Phaser.Time.TimerEvent | null = null; // Storm lightning timer
+  private apocalypseTimer: Phaser.Time.TimerEvent | null = null; // Apocalypse shake timer
+  private localPlayerTextureKeys: string[] = []; // Track meme textures for cleanup
+  public arenaCrowdSprites: Phaser.GameObjects.Sprite[] = []; // Crowd sprites for cheer reactions
+  public arenaSpotlightCones: Phaser.GameObjects.Sprite[] = []; // Spotlight cone sprites
+  public arenaCrowdCheering = false; // Flag to track if crowd is cheering
+  public arenaFighters: Map<number, Phaser.GameObjects.Sprite> = new Map(); // Fighter sprites
+  public arenaHealthBars: Map<
+    number,
+    { bg: Phaser.GameObjects.Rectangle; fill: Phaser.GameObjects.Rectangle }
+  > = new Map();
+  public arenaLastHitEffect: Map<number, number> = new Map(); // Track when last hit effect was shown (prevents spam)
+  public arenaLastFighterState: Map<number, string> = new Map(); // Track previous state for transition detection
+  public arenaComboCount: Map<number, number> = new Map(); // Track combo hits per fighter
+  public arenaLastAttacker: number = 0; // Track who attacked last for combo system
+  public arenaMatchState: {
+    matchId: number;
+    status: string;
+    fighter1: { id: number; hp: number; maxHp: number; x: number; y: number; state: string };
+    fighter2: { id: number; hp: number; maxHp: number; x: number; y: number; state: string };
+  } | null = null;
+  public ascensionElements: Phaser.GameObjects.GameObject[] = []; // Ascension zone elements
+  public ascensionZoneCreated = false; // Cache ascension zone elements
+  public foundersPopup: Phaser.GameObjects.Container | null = null; // Popup modal for building info
+  public foundersActiveTab: string = "overview"; // Current tab in DexScreener Workshop popup
+  private ballersGoldenSky: Phaser.GameObjects.Graphics | null = null; // Golden hour sky for Ballers Valley
+  private academyTwilightSky: Phaser.GameObjects.Graphics | null = null; // Magical twilight sky for Academy
+  public ascensionCelestialSky: Phaser.GameObjects.Graphics | null = null; // Celestial sky for ascension zone
+  public ascensionSkyElements: Phaser.GameObjects.GameObject[] = []; // Stars, motes, auroras, etc.
+  private academyMoon: Phaser.GameObjects.Arc | null = null; // Moon for Academy zone
+  private academyStars: Phaser.GameObjects.Arc[] = []; // Extra bright stars for Academy
+  private boundZoneChange: ((e: Event) => void) | null = null;
+  private zoneGround: Phaser.GameObjects.TileSprite | null = null;
+  private zonePath: Phaser.GameObjects.TileSprite | null = null;
+  public billboardTexts: Phaser.GameObjects.Text[] = [];
+  public tickerText: Phaser.GameObjects.Text | null = null;
+  public tickerOffset = 0;
+  public tickerTimer: Phaser.Time.TimerEvent | null = null;
+  public cachedTickerContent: string | null = null;
+  public tickerWorldStateVersion = -1;
+  public worldStateVersion = 0;
+  public skylineSprites: Phaser.GameObjects.Sprite[] = [];
+  public distantSkylineGfx: (Phaser.GameObjects.Graphics | Phaser.GameObjects.Rectangle)[] = []; // Persistent background skyline (not animated in transitions)
+  private skylineHazeLayer: Phaser.GameObjects.Graphics | null = null; // Horizon haze (time-aware)
+  private skylineWindowsLayer: Phaser.GameObjects.Graphics | null = null; // Building window lights
+  private skylineGlowLayer: Phaser.GameObjects.Graphics | null = null; // Window glow spots
+  private skylineFlickerRects: Phaser.GameObjects.Rectangle[] = []; // Animated window flickers
+  private academyBuildings: Phaser.GameObjects.Sprite[] = []; // Academy building sprites
+  public billboardTimer: Phaser.Time.TimerEvent | null = null;
+  public trafficTimers: Phaser.Time.TimerEvent[] = [];
+  public originalPositions: Map<Phaser.GameObjects.GameObject, number> = new Map(); // Store original X positions
+
+  // Speech bubble manager for autonomous dialogue
+  private speechBubbleManager: SpeechBubbleManager | null = null;
+  private lastDialogueLine: string | null = null; // Track last line to avoid duplicates
+
+  // AI-driven character behavior
+  private characterTargets: Map<string, { x: number; y: number; action: string }> = new Map();
+  private boundBehaviorHandler: ((e: Event) => void) | null = null;
+  private boundSpeakHandler: ((e: Event) => void) | null = null;
+
+  // Agent server WebSocket connection
+  private agentSocket: WebSocket | null = null;
+  private agentReconnectAttempts = 0;
+  private readonly maxAgentReconnectAttempts = 5;
+  private worldStateUpdateTimer: Phaser.Time.TimerEvent | null = null;
+  private agentReconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  // Performance: character lookup map for O(1) access in update loop
+  private characterById: Map<string, GameCharacter> = new Map();
+  // Performance: cached movement speeds per character (avoid random() every frame)
+  private characterSpeeds: Map<string, number> = new Map();
+
+  // === LOCAL PLAYER CONTROLS ===
+  private localPlayer: Phaser.GameObjects.Sprite | null = null;
+  private playerEnabled = false; // Disabled by default - enabled via "Enter World" button
+  private playerSpriteVariant = 0; // Which character sprite the player chose
+  private cursors: Phaser.Types.Input.Keyboard.CursorKeys | null = null;
+  private wasdKeys: {
+    W: Phaser.Input.Keyboard.Key;
+    A: Phaser.Input.Keyboard.Key;
+    S: Phaser.Input.Keyboard.Key;
+    D: Phaser.Input.Keyboard.Key;
+    E: Phaser.Input.Keyboard.Key; // Interact key
+  } | null = null;
+  private playerVelocity = { x: 0, y: 0 }; // Smooth movement
+  private playerWalkCycle = 0; // Animation cycle for walking bob
+  private readonly PLAYER_WALK_SPEED = 1.8; // Natural walking speed (pixels per frame)
+  private readonly PLAYER_SPRINT_SPEED = 3.6; // Sprint speed when holding Shift
+  private readonly PLAYER_ACCELERATION = 0.15; // How quickly player reaches walk speed
+  private readonly PLAYER_SPRINT_ACCELERATION = 0.25; // Faster acceleration when sprinting
+  private readonly PLAYER_FRICTION = 0.85; // Deceleration when not pressing keys
+  private sprintKey: Phaser.Input.Keyboard.Key | null = null;
+  private nearbyNPC: GameCharacter | null = null; // NPC player is near (for interaction)
+  private nearbyBuilding: GameBuilding | null = null; // Building player is near (for interaction)
+  private nearbyHelper = false; // Player is near the helper NPC
+  private interactPrompt: Phaser.GameObjects.Container | null = null; // "Press E to talk/enter" UI
+
+  // Robust E-key interaction: Phaser's JustDown can miss presses when the canvas
+  // lacks focus, so we also track the key via a window listener.
+  private eKeyPressed = false;
+  private boundEKeyDown: ((e: KeyboardEvent) => void) | null = null;
+
+  // Helper/guide NPC
+  public helperNPC: Phaser.GameObjects.Sprite | null = null;
+  private helperBubbleManager: SpeechBubbleManager | null = null;
+  private helperLineIndex = 0;
+  private helperGreeted = false;
+
+  // NPC Awareness — NPCs greet the player when approached
+  private previousNearbyNPC: GameCharacter | null = null;
+  private npcGreetCooldowns: Map<string, number> = new Map();
+  private readonly NPC_GREET_COOLDOWN_MS = 60000; // 60s per NPC
+  private lastNpcGreetTime = 0;
+  private readonly GLOBAL_NPC_GREET_COOLDOWN_MS = 12000; // 12s between any greetings
+  private npcGreetZoneEntryTime = 0; // suppress greetings for 5s after zone entry
+  private readonly NPC_GREET_ZONE_GRACE_MS = 5000;
+
+  // Wild Encounter system
+  private encounterCooldowns: Map<string, number> = new Map();
+  private readonly ENCOUNTER_COOLDOWN_MS = 90000;
+  private readonly ENCOUNTER_RADIUS = 50;
+  private readonly ENCOUNTER_CHANCE = 0.08;
+  private lastGlobalEncounter = Date.now(); // Grace period: no encounters on first load
+  private readonly GLOBAL_ENCOUNTER_COOLDOWN_MS = 45000;
+  private encounterActive = false;
+  private encounterActiveTimeout: ReturnType<typeof setTimeout> | null = null;
+  private readonly ENCOUNTER_MAX_DURATION_MS = 300000; // 5 min safety timeout
+  private playerStunned = false;
+  private stunStars: Phaser.GameObjects.Text[] = [];
+  private boundEncounterEnd: ((e: Event) => void) | null = null;
+  private boundEnterWorld: ((e: Event) => void) | null = null;
+  private boundExitWorld: ((e: Event) => void) | null = null;
+  private pendingEnterWorld: (() => void) | null = null; // Queued spawn when zone is transitioning
+
+  public isMobile = false;
+
+  // Immersive camera state
+  private cameraFollowing = false;
+  private irisGraphics: Phaser.GameObjects.Graphics | null = null;
+
+  // Drag detection: prevents accidental taps when scrolling on mobile
+  private touchStartPos: { x: number; y: number } | null = null;
+  private touchStartTime = 0; // Timestamp of last pointerdown — used to detect long-press sprint
+  private wasDragGesture = false;
+  private static readonly TAP_DISTANCE_THRESHOLD = 12; // pixels
+  private static readonly LONG_PRESS_SPRINT_MS = 250; // Hold this long to sprint on release
+
+  // Tap-to-move (mobile only). `sprint` is set at release time from press duration.
+  private moveTarget: { x: number; sprint: boolean } | null = null;
+  private moveTargetBuilding: GameBuilding | null = null;
+  private moveTargetNPC: GameCharacter | null = null;
+  private tapMoveSuppressed = false;
+  private tapMarker: Phaser.GameObjects.Container | null = null;
+
+  // Mobile drag-to-pan disabled when player is in world
+  private mobileDragPanEnabled = true;
+
+  constructor() {
+    super({ key: "WorldScene" });
+  }
+
+  create(): void {
+    this.isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+    // Suppress NPC greetings for 5s on initial load
+    this.npcGreetZoneEntryTime = Date.now();
+
+    // Create layered ground
+    this.createGround();
+
+    // Create sky with gradient
+    this.createSky();
+
+    // Create day/night overlay
+    this.overlay = this.add.rectangle(
+      GAME_WIDTH / 2,
+      GAME_HEIGHT / 2,
+      GAME_WIDTH,
+      GAME_HEIGHT,
+      0x000000,
+      0
+    );
+    this.overlay.setDepth(DEPTH.UI_LOW);
+
+    // Add decorations (trees, bushes, benches, lamps)
+    this.createDecorations();
+
+    // Add extra decorations (flowers, rocks, fountain)
+    this.createExtraDecorations();
+
+    // Initialize clouds
+    this.createClouds();
+
+    // Add animals to the world
+    this.createAnimals();
+
+    // Store original positions of decorations and animals for zone transitions
+    this.storeOriginalPositions();
+
+    // Create ambient particles (pollen/leaves)
+    this.createAmbientParticles();
+
+    // Add subtle ground animation
+    this.tweens.add({
+      targets: this.ground,
+      tilePositionX: 16,
+      duration: 20000,
+      repeat: -1,
+      ease: "Linear",
+    });
+
+    // Start background music
+    this.startPokemonMusic();
+
+    // Listen for music toggle (store bound handler for cleanup)
+    this.boundToggleMusic = () => this.toggleMusic();
+    window.addEventListener("agencity-toggle-music", this.boundToggleMusic);
+
+    // Listen for track skip (store bound handler for cleanup)
+    this.boundSkipTrack = () => this.skipTrack();
+    window.addEventListener("agencity-skip-track", this.boundSkipTrack);
+
+    // Listen for previous track (store bound handler for cleanup)
+    this.boundPrevTrack = () => this.prevTrack();
+    window.addEventListener("agencity-prev-track", this.boundPrevTrack);
+
+    // Listen for bot effect commands
+    this.boundBotEffect = (e: Event) => this.handleBotEffect(e as CustomEvent);
+    window.addEventListener("agencity-bot-effect", this.boundBotEffect);
+
+    // Listen for bot animal commands
+    this.boundBotAnimal = (e: Event) => this.handleBotAnimal(e as CustomEvent);
+    window.addEventListener("agencity-bot-animal", this.boundBotAnimal);
+
+    // Listen for bot pokemon commands (Founders zone)
+    this.boundBotPokemon = (e: Event) => this.handleBotPokemon(e as CustomEvent);
+    window.addEventListener("agencity-bot-pokemon", this.boundBotPokemon);
+
+    // Listen for zone change events
+    this.boundZoneChange = (e: Event) => this.handleZoneChange(e as CustomEvent);
+    window.addEventListener("agencity-zone-change", this.boundZoneChange);
+
+    // Register cleanup on scene shutdown and destroy
+    this.events.on("shutdown", this.cleanup, this);
+    this.events.on("destroy", this.cleanup, this);
+
+    // Initialize speech bubble manager for autonomous dialogue
+    this.speechBubbleManager = new SpeechBubbleManager(this, this.characterSprites);
+
+    // Listen for AI behavior commands
+    this.boundBehaviorHandler = (e: Event) => this.handleBehaviorCommand(e as CustomEvent);
+    window.addEventListener("agencity-character-behavior", this.boundBehaviorHandler);
+
+    // Listen for character speak events
+    this.boundSpeakHandler = (e: Event) => this.handleCharacterSpeak(e as CustomEvent);
+    window.addEventListener("agencity-character-speak", this.boundSpeakHandler);
+
+    // Listen for encounter end events (from React overlay)
+    this.boundEncounterEnd = (e: Event) => this.handleEncounterEnd(e as CustomEvent);
+    window.addEventListener("agencity-encounter-end", this.boundEncounterEnd);
+
+    // Setup local player controls (WASD/arrow keys to walk around)
+    this.setupLocalPlayer();
+
+    // Setup mobile camera controls (drag to pan, pinch to zoom)
+    this.setupMobileCameraControls();
+
+    // Set up tap-to-move input handler (mobile only)
+    this.setupTapToMove();
+
+    // Listen for tutorial step changes from React
+    this.initTutorialListener();
+
+    // Connect to agent server for bidirectional communication
+    this.connectToAgentServer();
+
+    // Extract Phaser textures to data URLs for React battle overlay
+    extractBattleTextures(this);
+
+    // Signal to React that the scene is ready for worldState updates
+    window.dispatchEvent(new Event("worldscene-ready"));
+  }
+
+  // === LOCAL PLAYER SETUP ===
+  private setupLocalPlayer(): void {
+    // Setup keyboard input
+    if (this.input.keyboard) {
+      this.cursors = this.input.keyboard.createCursorKeys();
+      // Remove capture so arrow keys, space, and shift don't block typing in inputs
+      this.input.keyboard.removeCapture([
+        Phaser.Input.Keyboard.KeyCodes.UP,
+        Phaser.Input.Keyboard.KeyCodes.DOWN,
+        Phaser.Input.Keyboard.KeyCodes.LEFT,
+        Phaser.Input.Keyboard.KeyCodes.RIGHT,
+        Phaser.Input.Keyboard.KeyCodes.SPACE,
+        Phaser.Input.Keyboard.KeyCodes.SHIFT,
+      ]);
+      // enableCapture = false so WASD/E/Shift keys still reach <input> elements
+      this.wasdKeys = {
+        W: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W, false),
+        A: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A, false),
+        S: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S, false),
+        D: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D, false),
+        E: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E, false),
+      };
+      this.sprintKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT, false);
+    }
+
+    // Fallback window listener for the E key: Phaser's JustDown misses presses
+    // when the canvas is not focused (common after closing a React modal).
+    this.boundEKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "e" && e.key !== "E") return;
+      if ((window as any).__agencity_modal_open) return;
+      const activeTag = document.activeElement?.tagName;
+      if (activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT") return;
+      this.eKeyPressed = true;
+    };
+    window.addEventListener("keydown", this.boundEKeyDown);
+
+    // Create "Press E to talk" prompt (hidden initially)
+    this.createInteractPrompt();
+
+    // Listen for "Enter World" event from React UI
+    this.boundEnterWorld = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      const spriteVariant = detail?.spriteVariant ?? 0;
+      const customSpriteUrl = detail?.customSpriteUrl;
+      const walkSpriteSheetUrl = detail?.walkSpriteSheetUrl;
+      const memeName = detail?.memeName;
+
+      if (customSpriteUrl) {
+        // Load AI-generated meme sprite (with optional walk animation)
+        this.loadAndEnterWithCustomSprite(customSpriteUrl, memeName, walkSpriteSheetUrl);
+      } else {
+        // Use default sprite variant
+        this.enterWorld(spriteVariant);
+      }
+    };
+    window.addEventListener("agencity-enter-world", this.boundEnterWorld);
+
+    // Listen for "Exit World" event
+    this.boundExitWorld = () => this.exitWorld();
+    window.addEventListener("agencity-exit-world", this.boundExitWorld);
+  }
+
+  private loadAndEnterWithCustomSprite(
+    imageUrl: string,
+    memeName: string,
+    walkSpriteSheetUrl?: string
+  ): void {
+    if (this.playerEnabled && this.localPlayer) return;
+
+    // Generate unique texture keys for this meme (tracked for cleanup on exit)
+    const textureKey = `meme_player_${Date.now()}`;
+    const walkTextureKey = walkSpriteSheetUrl ? `meme_walk_${Date.now()}` : null;
+    this.localPlayerTextureKeys = [textureKey];
+    if (walkTextureKey) this.localPlayerTextureKeys.push(walkTextureKey);
+
+    // Load the main character image
+    this.load.image(textureKey, imageUrl);
+
+    // Also load walk sprite sheet if provided
+    if (walkSpriteSheetUrl && walkTextureKey) {
+      // Load as spritesheet - 2x2 grid of 4 walk frames
+      this.load.spritesheet(walkTextureKey, walkSpriteSheetUrl, {
+        frameWidth: 512, // 1024 / 2
+        frameHeight: 512, // 1024 / 2
+      });
+    }
+
+    this.load.once("complete", () => {
+      this.enterWorldWithTexture(textureKey, memeName, walkTextureKey);
+    });
+    this.load.once("loaderror", () => {
+      console.error("[WorldScene] Failed to load meme sprite, using default");
+      this.enterWorld(0); // Fallback to default
+    });
+    this.load.start();
+  }
+
+  private enterWorldWithTexture(
+    textureKey: string,
+    memeName?: string,
+    walkTextureKey?: string | null
+  ): void {
+    if (this.playerEnabled && this.localPlayer) return;
+
+    // If a zone transition is in progress, queue the spawn for when it completes
+    if (this.isTransitioning) {
+      this.pendingEnterWorld = () =>
+        this.enterWorldWithTexture(textureKey, memeName, walkTextureKey);
+      return;
+    }
+
+    this.playerSpriteVariant = -1; // Custom sprite
+    this.playerEnabled = true;
+
+    const pathLevel = Y.PATH_LEVEL;
+    const startX = GAME_WIDTH / 2;
+
+    // If we have a walk sprite sheet, use it as a sprite with animation
+    if (walkTextureKey && this.textures.exists(walkTextureKey)) {
+      // Create walk animation from sprite sheet
+      const walkAnimKey = `${walkTextureKey}_walk`;
+      if (!this.anims.exists(walkAnimKey)) {
+        this.anims.create({
+          key: walkAnimKey,
+          frames: this.anims.generateFrameNumbers(walkTextureKey, { start: 0, end: 3 }),
+          frameRate: 8,
+          repeat: -1,
+        });
+      }
+
+      // Create player with walk sprite sheet
+      this.localPlayer = this.add.sprite(startX, pathLevel, walkTextureKey, 0);
+      this.localPlayer.setDepth(12);
+      this.localPlayer.setScale(0.15); // Scale down AI-generated image
+      this.localPlayer.setOrigin(0.5, 1);
+
+      // Store keys for use during movement
+      (this.localPlayer as any).walkAnimKey = walkAnimKey;
+      (this.localPlayer as any).walkTextureKey = walkTextureKey;
+      (this.localPlayer as any).idleTextureKey = textureKey;
+      (this.localPlayer as any).hasWalkAnim = true;
+    } else {
+      // Create player with static meme texture (no walk animation)
+      this.localPlayer = this.add.sprite(startX, pathLevel, textureKey);
+      this.localPlayer.setDepth(12);
+      this.localPlayer.setScale(0.15); // Scale down AI-generated image (usually 1024x1024)
+      this.localPlayer.setOrigin(0.5, 1);
+      (this.localPlayer as any).hasWalkAnim = false;
+    }
+
+    // Drop shadow under player feet — meme sprites are large, scale shadow wider
+    this.attachShadow(this.localPlayer, 1.7);
+
+    // Add player name label if meme name provided
+    if (memeName) {
+      const nameLabel = this.add.text(startX, pathLevel + 10, memeName, {
+        fontFamily: "monospace",
+        fontSize: "10px",
+        color: "#22c55e",
+        stroke: "#000000",
+        strokeThickness: 2,
+      });
+      nameLabel.setOrigin(0.5, 0);
+      nameLabel.setDepth(12);
+
+      // Store reference for cleanup and movement sync
+      (this.localPlayer as any).nameLabel = nameLabel;
+    }
+
+    // Cool spawn effect
+    this.playSpawnEffect(startX, pathLevel);
+
+    // Camera follow + zoom
+    if (this.localPlayer) {
+      this.cameras.main.setBounds(0, 0, GAME_WIDTH, GAME_HEIGHT);
+      this.cameras.main.startFollow(this.localPlayer, true, 0.08, 0.08);
+      this.cameras.main.setDeadzone(30, 15);
+      this.cameras.main.zoomTo(1.3, 800, "Sine.easeInOut");
+      this.cameraFollowing = true;
+    }
+
+    // Enable tap-to-move on mobile
+    this.enableTapToMove();
+
+    window.dispatchEvent(new CustomEvent("agencity-player-entered"));
+  }
+
+  private enterWorld(spriteVariant: number): void {
+    if (this.playerEnabled && this.localPlayer) return; // Already in world
+
+    // If a zone transition is in progress, queue the spawn for when it completes
+    if (this.isTransitioning) {
+      this.pendingEnterWorld = () => this.enterWorld(spriteVariant);
+      return;
+    }
+
+    this.playerSpriteVariant = spriteVariant;
+    (window as unknown as Record<string, unknown>).__agencity_player_variant = spriteVariant;
+    this.playerEnabled = true;
+
+    // Create player sprite with chosen variant
+    const pathLevel = Y.PATH_LEVEL;
+    const startX = GAME_WIDTH / 2;
+
+    const textureKey = `character_${spriteVariant}`;
+    this.localPlayer = this.add.sprite(startX, pathLevel, textureKey);
+    this.localPlayer.setDepth(12); // Above NPCs
+    this.localPlayer.setScale(1.4); // Slightly larger than NPCs
+    this.localPlayer.setOrigin(0.5, 1);
+
+    // Drop shadow under player feet — pixel character sprites use 1.0 width
+    this.attachShadow(this.localPlayer, 1.0);
+
+    // Play cool spawn effect
+    this.playSpawnEffect(startX, pathLevel, 1.4);
+
+    // Camera follow + zoom
+    this.cameras.main.setBounds(0, 0, GAME_WIDTH, GAME_HEIGHT);
+    this.cameras.main.startFollow(this.localPlayer, true, 0.08, 0.08);
+    this.cameras.main.zoomTo(1.3, 800, "Sine.easeInOut");
+    this.cameraFollowing = true;
+
+    // Enable tap-to-move on mobile
+    this.enableTapToMove();
+
+    // Notify React that player entered
+    window.dispatchEvent(new CustomEvent("agencity-player-entered"));
+
+    // Spawn the helper/guide NPC in the city
+    this.createHelperNPC();
+  }
+
+  private createHelperNPC(): void {
+    if (this.helperNPC) return; // Already spawned
+
+    const pathLevel = Y.PATH_LEVEL;
+    const x = Math.round(GAME_WIDTH * 0.32); // Slightly left of center so she greets arriving players
+
+    const sprite = this.add.sprite(x, pathLevel, "character_4");
+    sprite.setOrigin(0.5, 1);
+    sprite.setScale(1.3);
+    sprite.setDepth(11); // Above generic NPCs, below local player
+    sprite.setInteractive({ useHandCursor: true });
+    this.attachShadow(sprite, 0.9);
+
+    // Idle bob animation
+    this.tweens.add({
+      targets: sprite,
+      y: pathLevel - 2,
+      duration: 800,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.easeInOut",
+    });
+
+    // Exclamation/question indicator to show she's interactive
+    const indicator = this.add.text(x, pathLevel - Math.round(42 * SCALE), "?", {
+      fontFamily: '"Press Start 2P", monospace',
+      fontSize: "12px",
+      color: "#fbbf24",
+      fontStyle: "bold",
+    });
+    indicator.setOrigin(0.5, 0.5);
+    indicator.setDepth(200);
+    (sprite as any)._helperIndicator = indicator;
+    this.tweens.add({
+      targets: indicator,
+      y: pathLevel - Math.round(50 * SCALE),
+      duration: 600,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.easeInOut",
+    });
+
+    // Click to talk
+    sprite.on("pointerup", () => {
+      if (this.wasDragGesture) return;
+      this.talkToHelper();
+    });
+
+    // Hover scale
+    sprite.on("pointerover", () => sprite.setScale(1.45));
+    sprite.on("pointerout", () => sprite.setScale(1.3));
+
+    this.helperNPC = sprite;
+
+    // Speech bubble manager scoped to this single sprite
+    this.helperBubbleManager = new SpeechBubbleManager(
+      this,
+      new Map([["character_4", sprite]]),
+      { displayDuration: 4500, maxWidth: 280, yOffset: -70 }
+    );
+
+    // Greet the player automatically the first time they enter the city
+    this.time.delayedCall(1200, () => {
+      if (this.helperNPC?.active && this.currentZone === "main_city" && !this.helperGreeted) {
+        this.helperGreeted = true;
+        this.showHelperBubble("Hi! I'm AgenC #285. Press E or click me for a quick tour.");
+      }
+    });
+  }
+
+  private showHelperBubble(message: string): void {
+    if (!this.helperBubbleManager || !this.helperNPC?.active) return;
+    this.helperBubbleManager.showBubble({
+      characterId: "character_4",
+      characterName: "AgenC #285",
+      message,
+      timestamp: Date.now(),
+      emotion: "happy",
+    });
+  }
+
+  private talkToHelper(): void {
+    if (!this.helperNPC?.active) return;
+
+    const lines = [
+      "Welcome to AgenCity! I'm AgenC #285, your guide.",
+      "Each district maps to a feature of the app.",
+      "City is home. Catalog is where you hire AI agents.",
+      "My Tasks tracks your deliveries; Earnings shows referrals.",
+      "Proof is live on-chain verification, and Trust covers buyer protection.",
+      "Use WASD or arrow keys to move. Press E near a building to open it.",
+      "On mobile, tap where you want to walk, then tap a building to enter.",
+      "Good luck exploring the city!",
+    ];
+
+    this.showHelperBubble(lines[this.helperLineIndex]);
+    this.helperLineIndex++;
+    if (this.helperLineIndex >= lines.length) {
+      this.helperLineIndex = 0;
+    }
+  }
+
+  private playSpawnEffect(x: number, y: number, targetScale: number = 1.4): void {
+    if (!this.localPlayer) return;
+
+    // Play entry sound effect
+    this.playSpawnSfx();
+
+    // Play iris-in reveal
+    this.playIrisIn(x, y);
+
+    // Start from above and drop down with effects
+    const spawnY = y - 200;
+    this.localPlayer.setPosition(x, spawnY);
+    this.localPlayer.setAlpha(0);
+    this.localPlayer.setScale(targetScale * 0.2);
+
+    // Create spawn particle burst
+    const spawnParticles = this.add.particles(x, y - 30, "particle", {
+      speed: { min: 50, max: 150 },
+      angle: { min: 0, max: 360 },
+      scale: { start: 0.4, end: 0 },
+      alpha: { start: 1, end: 0 },
+      tint: [0x22c55e, 0x4ade80, 0x86efac, 0xffffff], // Green sparkles
+      lifespan: 600,
+      quantity: 20,
+      emitting: false,
+    });
+    spawnParticles.setDepth(13);
+
+    // Create landing dust effect
+    const dustParticles = this.add.particles(x, y, "particle", {
+      speed: { min: 30, max: 80 },
+      angle: { min: -150, max: -30 },
+      scale: { start: 0.3, end: 0 },
+      alpha: { start: 0.8, end: 0 },
+      tint: 0xd4a574, // Dusty brown
+      lifespan: 400,
+      quantity: 12,
+      emitting: false,
+    });
+    dustParticles.setDepth(9);
+
+    // Spawn animation - drop from sky with bounce
+    this.tweens.add({
+      targets: this.localPlayer,
+      y: y,
+      alpha: 1,
+      scale: targetScale,
+      duration: 500,
+      ease: "Bounce.easeOut",
+      onStart: () => {
+        spawnParticles.emitParticle(20);
+      },
+      onComplete: () => {
+        dustParticles.emitParticle(12);
+
+        // Squash effect on landing
+        this.tweens.add({
+          targets: this.localPlayer,
+          scaleX: targetScale * 1.15,
+          scaleY: targetScale * 0.85,
+          duration: 80,
+          yoyo: true,
+          ease: "Sine.easeInOut",
+        });
+
+        // Cleanup particles
+        this.time.delayedCall(800, () => {
+          spawnParticles.destroy();
+          dustParticles.destroy();
+        });
+      },
+    });
+  }
+
+  private playIrisIn(cx: number, cy: number): void {
+    // Clean up any previous iris
+    if (this.irisGraphics) {
+      this.cameras.main.clearMask();
+      this.irisGraphics.destroy();
+      this.irisGraphics = null;
+    }
+
+    const maxRadius = Math.max(GAME_WIDTH, GAME_HEIGHT);
+    const gfx = this.add.graphics();
+    gfx.setDepth(200);
+    this.irisGraphics = gfx;
+
+    // Start with a tiny circle at spawn point
+    gfx.clear();
+    gfx.fillStyle(0xffffff);
+    gfx.fillCircle(cx, cy, 1);
+
+    const mask = gfx.createGeometryMask();
+    this.cameras.main.setMask(mask);
+
+    // Tween a custom property to drive the radius
+    const proxy = { radius: 1 };
+    this.tweens.add({
+      targets: proxy,
+      radius: maxRadius,
+      duration: 700,
+      ease: "Cubic.easeOut",
+      onUpdate: () => {
+        gfx.clear();
+        gfx.fillStyle(0xffffff);
+        gfx.fillCircle(cx, cy, proxy.radius);
+      },
+      onComplete: () => {
+        this.cameras.main.clearMask();
+        gfx.destroy();
+        if (this.irisGraphics === gfx) {
+          this.irisGraphics = null;
+        }
+      },
+    });
+  }
+
+  private exitWorld(): void {
+    if (!this.playerEnabled || !this.localPlayer) return;
+
+    this.playerEnabled = false;
+
+    // Disable tap-to-move on mobile
+    this.disableTapToMove();
+
+    // Play exit sound
+    this.playExitSfx();
+
+    // Stop camera follow and zoom back to overview
+    if (this.cameraFollowing) {
+      this.cameras.main.stopFollow();
+      this.cameraFollowing = false;
+      this.cameras.main.zoomTo(1.0, 500, "Sine.easeInOut");
+      this.time.delayedCall(500, () => {
+        this.cameras.main.scrollX = 0;
+        this.cameras.main.scrollY = 0;
+      });
+    }
+
+    // Clean up iris if mid-animation
+    if (this.irisGraphics) {
+      this.cameras.main.clearMask();
+      this.irisGraphics.destroy();
+      this.irisGraphics = null;
+    }
+
+    // Capture references before nulling — the fade-out tween needs the sprite
+    const exitingPlayer = this.localPlayer;
+    const textureKeysToClean = [...this.localPlayerTextureKeys];
+    this.localPlayer = null; // Null immediately so re-entry is safe during fade
+    this.localPlayerTextureKeys = [];
+    this.playerVelocity = { x: 0, y: 0 };
+    this.nearbyNPC = null;
+    this.nearbyBuilding = null;
+    this.pendingEnterWorld = null;
+    if (this.interactPrompt) {
+      this.interactPrompt.setVisible(false);
+    }
+
+    // Clean up name label if present (for meme sprites)
+    const nameLabel = (exitingPlayer as any).nameLabel as Phaser.GameObjects.Text | undefined;
+    if (nameLabel) {
+      nameLabel.destroy();
+    }
+
+    // Capture player drop shadow so the fade-out tween can also fade and
+    // destroy it together with the sprite. Stored on sprite as _shadow.
+    const exitingShadow = (exitingPlayer as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+    (exitingPlayer as any)._shadow = null;
+
+    // Camera fade out
+    this.cameras.main.fade(300, 0, 0, 0);
+
+    // Fade the shadow out alongside the player so it doesn't pop
+    if (exitingShadow) {
+      this.tweens.add({
+        targets: exitingShadow,
+        alpha: 0,
+        duration: 300,
+        ease: "Cubic.easeIn",
+        onComplete: () => exitingShadow.destroy(),
+      });
+    }
+
+    // Fade out animation on the captured sprite
+    this.tweens.add({
+      targets: exitingPlayer,
+      alpha: 0,
+      scale: 0.5,
+      duration: 300,
+      ease: "Cubic.easeIn",
+      onComplete: () => {
+        exitingPlayer.destroy();
+        // Clean up meme player textures to prevent memory leak (~4MB each)
+        for (const key of textureKeysToClean) {
+          if (this.textures.exists(key)) {
+            this.textures.remove(key);
+          }
+        }
+        // Reset camera FX after fade completes
+        this.cameras.main.resetFX();
+      },
+    });
+
+    // Notify React that player exited
+    window.dispatchEvent(new CustomEvent("agencity-player-exited"));
+  }
+
+  private createInteractPrompt(): void {
+    // Create a container for the interaction prompt
+    this.interactPrompt = this.add.container(0, 0);
+    this.interactPrompt.setDepth(150);
+    this.interactPrompt.setVisible(false);
+
+    const promptText = this.isMobile ? "Tap to talk" : "Press E to talk";
+    const pillWidth = this.isMobile ? 100 : 120;
+
+    // Background pill
+    const bg = this.add.graphics();
+    bg.fillStyle(0x000000, 0.8);
+    bg.fillRoundedRect(-pillWidth / 2, -15, pillWidth, 30, 8);
+    this.interactPrompt.add(bg);
+
+    // Text
+    const text = this.add.text(0, 0, promptText, {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#ffffff",
+    });
+    text.setOrigin(0.5, 0.5);
+    this.interactPrompt.add(text);
+
+    // On mobile, make the prompt tappable to trigger interaction
+    // Uses pointerup + drag guard to prevent accidental triggers while panning
+    if (this.isMobile) {
+      const hitArea = this.add.rectangle(0, 0, pillWidth + 20, 50, 0x000000, 0);
+      hitArea.setInteractive({ useHandCursor: true });
+      hitArea.on("pointerup", () => {
+        if (this.wasDragGesture) return;
+        if (this.nearbyNPC) {
+          this.interactWithNPC(this.nearbyNPC);
+        } else if (this.nearbyBuilding) {
+          this.interactWithBuilding(this.nearbyBuilding);
+        }
+      });
+      this.interactPrompt.add(hitArea);
+    }
+  }
+
+  // === TAP-TO-MOVE (mobile) ===
+
+  private setupTapToMove(): void {
+    if (!this.isMobile) return;
+
+    this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+      if (!this.playerEnabled) return;
+      if (this.wasDragGesture) return;
+      if ((window as any).__agencity_modal_open) return;
+      if (this.isTransitioning) return;
+      if (this.encounterActive) return;
+      if (this.tapMoveSuppressed) return;
+
+      // Long-press to sprint: any press held >= LONG_PRESS_SPRINT_MS releases as sprint
+      const heldMs = Date.now() - this.touchStartTime;
+      const sprint = heldMs >= WorldScene.LONG_PRESS_SPRINT_MS;
+
+      const hitObjects = this.input.hitTestPointer(pointer);
+
+      // Check if tap hit a building
+      for (const obj of hitObjects) {
+        const buildingId = (obj as any)._buildingId as string | undefined;
+        if (buildingId) {
+          const building = this.buildingById.get(buildingId);
+          const container = obj as Phaser.GameObjects.Container;
+          if (building && this.localPlayer) {
+            const dx = Math.abs(this.localPlayer.x - container.x);
+            if (dx > 150) {
+              // Far — walk there, interact on arrival
+              this.moveTarget = { x: container.x, sprint };
+              this.moveTargetBuilding = building;
+              this.moveTargetNPC = null;
+              this.showTapMarker(container.x, sprint);
+              this.kickStartMovement(container.x, sprint);
+            }
+            // Close — the building's own pointerup handler opens the modal
+          }
+          return;
+        }
+      }
+
+      // Check if tap hit an NPC
+      for (const obj of hitObjects) {
+        const characterId = (obj as any)._characterId as string | undefined;
+        if (characterId) {
+          const sprite = this.characterSprites.get(characterId);
+          if (sprite && this.localPlayer) {
+            const dx = Math.abs(this.localPlayer.x - sprite.x);
+            if (dx > 150) {
+              this.moveTarget = { x: sprite.x, sprint };
+              this.moveTargetNPC =
+                this.worldState?.population?.find((c: GameCharacter) => c.id === characterId) ||
+                null;
+              this.moveTargetBuilding = null;
+              this.showTapMarker(sprite.x, sprint);
+              this.kickStartMovement(sprite.x, sprint);
+            }
+          }
+          return;
+        }
+      }
+
+      // Check if tap hit the player sprite — stop
+      if (this.localPlayer && hitObjects.includes(this.localPlayer)) {
+        this.moveTarget = null;
+        this.moveTargetBuilding = null;
+        this.moveTargetNPC = null;
+        this.hideTapMarker();
+        return;
+      }
+
+      // Tap on empty ground — walk to world X position
+      const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+      const targetX = Phaser.Math.Clamp(worldPoint.x, 40, GAME_WIDTH - 40);
+      this.moveTarget = { x: targetX, sprint };
+      this.moveTargetBuilding = null;
+      this.moveTargetNPC = null;
+      this.showTapMarker(targetX, sprint);
+      this.kickStartMovement(targetX, sprint);
+    });
+  }
+
+  // === DROP SHADOWS ===
+  // Attach a soft elliptical shadow under a sprite (player or NPC). Stored on
+  // the sprite as `_shadow` so cleanup paths can destroy it. The vertical
+  // offset is computed from the sprite's current display height + origin so
+  // it works for both bottom-anchored players (origin 0.5, 1) and
+  // center-anchored NPCs (origin 0.5, 0.5).
+  private attachShadow(sprite: Phaser.GameObjects.Sprite, scaleX: number): void {
+    const feetOffsetY = sprite.displayHeight * (1 - sprite.originY) + 1;
+    const shadow = this.add.sprite(sprite.x, sprite.y + feetOffsetY, "character_shadow");
+    shadow.setOrigin(0.5, 0.5);
+    // Depth 9: above ground/path/decorations (0–4), below NPCs (10–11) and player (12)
+    shadow.setDepth(9);
+    shadow.setScale(scaleX, 1.0);
+    shadow.setVisible(sprite.visible);
+    (sprite as any)._shadow = shadow;
+    (sprite as any)._shadowFeetOffsetY = feetOffsetY;
+  }
+
+  // Sync a sprite's shadow to its current world position. Cheap — just two
+  // assignments. Called from updateLocalPlayer and the per-frame NPC loop.
+  private syncShadow(sprite: Phaser.GameObjects.Sprite): void {
+    const shadow = (sprite as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+    if (!shadow) return;
+    const offsetY = (sprite as any)._shadowFeetOffsetY ?? 0;
+    shadow.x = sprite.x;
+    shadow.y = sprite.y + offsetY;
+  }
+
+  // Velocity kick for responsive tap feel — sprint taps kick at sprint speed,
+  // walk taps kick at walk speed. Both at 50% to feel snappy without overshooting.
+  private kickStartMovement(targetX: number, sprint: boolean): void {
+    if (!this.localPlayer) return;
+    const dx = targetX - this.localPlayer.x;
+    const baseSpeed = sprint ? this.PLAYER_SPRINT_SPEED : this.PLAYER_WALK_SPEED;
+    this.playerVelocity.x = Math.sign(dx) * baseSpeed * 0.5;
+  }
+
+  // Persistent destination marker — single reusable container that stays visible
+  // until arrival or until the next tap repositions it. Color encodes sprint vs walk.
+  private showTapMarker(worldX: number, sprint: boolean): void {
+    if (!this.localPlayer) return;
+
+    // Lazy-create the marker container once and reuse it forever
+    if (!this.tapMarker) {
+      const container = this.add.container(worldX, Y.PATH_LEVEL);
+      container.setDepth(15);
+
+      const ring = this.add.graphics();
+      const dot = this.add.graphics();
+      const arrow = this.add.text(0, -18, "", {
+        fontFamily: "monospace",
+        fontSize: "14px",
+        color: "#4ade80",
+      });
+      arrow.setOrigin(0.5, 0.5);
+
+      container.add(ring);
+      container.add(dot);
+      container.add(arrow);
+
+      (container as any)._ring = ring;
+      (container as any)._dot = dot;
+      (container as any)._arrow = arrow;
+
+      this.tapMarker = container;
+
+      // Subtle infinite pulse so the marker reads as alive
+      this.tweens.add({
+        targets: container,
+        scaleX: { from: 1.0, to: 1.18 },
+        scaleY: { from: 1.0, to: 1.18 },
+        alpha: { from: 0.95, to: 0.55 },
+        duration: 650,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    const ring = (this.tapMarker as any)._ring as Phaser.GameObjects.Graphics;
+    const dot = (this.tapMarker as any)._dot as Phaser.GameObjects.Graphics;
+    const arrow = (this.tapMarker as any)._arrow as Phaser.GameObjects.Text;
+
+    // Sprint = amber (#fbbf24), walk = green (#4ade80)
+    const color = sprint ? 0xfbbf24 : 0x4ade80;
+    const colorHex = sprint ? "#fbbf24" : "#4ade80";
+    const radius = sprint ? 13 : 11;
+
+    ring.clear();
+    ring.lineStyle(sprint ? 3 : 2, color, 0.95);
+    ring.strokeCircle(0, 0, radius);
+    ring.fillStyle(color, 0.18);
+    ring.fillCircle(0, 0, radius);
+
+    dot.clear();
+    dot.fillStyle(color, 1);
+    dot.fillCircle(0, 0, 3);
+
+    arrow.setColor(colorHex);
+    arrow.setText(sprint ? "\u25be\u25be" : "\u25be");
+
+    this.tapMarker.setPosition(worldX, Y.PATH_LEVEL);
+    this.tapMarker.setVisible(true);
+  }
+
+  // Hide the persistent tap marker (called on arrival, stop-tap, or world exit)
+  private hideTapMarker(): void {
+    if (this.tapMarker) {
+      this.tapMarker.setVisible(false);
+    }
+  }
+
+  private arriveAtMoveTarget(): void {
+    if (this.moveTargetBuilding) {
+      this.interactWithBuilding(this.moveTargetBuilding);
+    } else if (this.moveTargetNPC) {
+      this.interactWithNPC(this.moveTargetNPC);
+    }
+    this.moveTarget = null;
+    this.moveTargetBuilding = null;
+    this.moveTargetNPC = null;
+    this.hideTapMarker();
+  }
+
+  private enableTapToMove(): void {
+    if (!this.isMobile) return;
+    this.mobileDragPanEnabled = false;
+    // Suppress taps for 800ms while zoom animation plays
+    this.tapMoveSuppressed = true;
+    this.time.delayedCall(800, () => {
+      this.tapMoveSuppressed = false;
+    });
+  }
+
+  private disableTapToMove(): void {
+    if (!this.isMobile) return;
+    this.moveTarget = null;
+    this.moveTargetBuilding = null;
+    this.moveTargetNPC = null;
+    this.mobileDragPanEnabled = true;
+    this.hideTapMarker();
+  }
+
+  private updateLocalPlayer(): void {
+    if (!this.localPlayer || !this.playerEnabled) return;
+
+    // Skip all movement when a modal (arcade, casino, etc.) is open
+    if ((window as any).__agencity_modal_open) return;
+
+    // Skip movement when stunned (after encounter loss) or in encounter
+    if (this.playerStunned || this.encounterActive) return;
+
+    // Skip WASD movement when a text input or textarea is focused (chat boxes, modals, etc.)
+    const activeTag = document.activeElement?.tagName;
+    const isTyping = activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT";
+
+    // Get input state — keyboard (desktop) or tap-to-move (mobile)
+    let inputX = 0;
+    let inputY = 0;
+    let sprinting = false;
+    let interact = false;
+
+    if (this.isMobile && this.moveTarget && this.localPlayer) {
+      // Mobile: derive input from tap-to-move target. Sprint intent is set at
+      // press time (long-press = sprint) — not from distance, which made every
+      // medium tap accidentally sprint.
+      const dx = this.moveTarget.x - this.localPlayer.x;
+      if (Math.abs(dx) < 20) {
+        this.arriveAtMoveTarget();
+      } else {
+        inputX = dx > 0 ? 1 : -1;
+        sprinting = this.moveTarget.sprint;
+      }
+    } else if (!this.isMobile) {
+      // Desktop: read from keyboard
+      const left = this.cursors?.left.isDown || (!isTyping && this.wasdKeys?.A.isDown) || false;
+      const right = this.cursors?.right.isDown || (!isTyping && this.wasdKeys?.D.isDown) || false;
+      const up = this.cursors?.up.isDown || (!isTyping && this.wasdKeys?.W.isDown) || false;
+      const down = this.cursors?.down.isDown || (!isTyping && this.wasdKeys?.S.isDown) || false;
+      sprinting = this.sprintKey?.isDown || false;
+
+      if (left) inputX = -1;
+      else if (right) inputX = 1;
+      if (up) inputY = -1;
+      else if (down) inputY = 1;
+    }
+
+    // Prefer the window-level E-key tracker; fall back to Phaser's JustDown.
+    interact = !isTyping && (this.eKeyPressed || (this.wasdKeys?.E ? Phaser.Input.Keyboard.JustDown(this.wasdKeys.E) : false));
+    this.eKeyPressed = false;
+
+    // Apply acceleration based on input (natural walking feel)
+    const accel = sprinting ? this.PLAYER_SPRINT_ACCELERATION : this.PLAYER_ACCELERATION;
+    if (inputX !== 0) {
+      this.playerVelocity.x += inputX * accel;
+    } else {
+      // Apply friction when no input
+      this.playerVelocity.x *= this.PLAYER_FRICTION;
+    }
+
+    if (inputY !== 0) {
+      this.playerVelocity.y += inputY * accel;
+    } else {
+      this.playerVelocity.y *= this.PLAYER_FRICTION;
+    }
+
+    // Clamp velocity by vector magnitude (prevents diagonal sprint being ~41% faster)
+    const maxSpeed = sprinting ? this.PLAYER_SPRINT_SPEED : this.PLAYER_WALK_SPEED;
+    const mag = Math.sqrt(
+      this.playerVelocity.x * this.playerVelocity.x + this.playerVelocity.y * this.playerVelocity.y
+    );
+    if (mag > maxSpeed) {
+      const scale = maxSpeed / mag;
+      this.playerVelocity.x *= scale;
+      this.playerVelocity.y *= scale;
+    }
+
+    // Stop completely if velocity is very small
+    if (Math.abs(this.playerVelocity.x) < 0.1) this.playerVelocity.x = 0;
+    if (Math.abs(this.playerVelocity.y) < 0.1) this.playerVelocity.y = 0;
+
+    // Apply velocity
+    this.localPlayer.x += this.playerVelocity.x;
+    this.localPlayer.y += this.playerVelocity.y;
+
+    // Keep drop shadow planted under the player
+    this.syncShadow(this.localPlayer);
+
+    // Flip sprite based on movement direction
+    if (this.playerVelocity.x < -0.1) {
+      this.localPlayer.setFlipX(true);
+    } else if (this.playerVelocity.x > 0.1) {
+      this.localPlayer.setFlipX(false);
+    }
+
+    // Walking animation - use sprite sheet animation if available, otherwise bob
+    // Use appropriate base scale based on sprite type
+    const baseScale = this.playerSpriteVariant === -1 ? 0.15 : 1.4; // Custom meme sprites are larger images
+    const isMoving = Math.abs(this.playerVelocity.x) > 0.2 || Math.abs(this.playerVelocity.y) > 0.2;
+    const hasWalkAnim = (this.localPlayer as any).hasWalkAnim;
+    const walkAnimKey = (this.localPlayer as any).walkAnimKey;
+
+    if (isMoving) {
+      // If we have a walk animation sprite sheet, play it
+      if (hasWalkAnim && walkAnimKey) {
+        // Make sure we're using the walk sprite sheet texture
+        const walkTextureKey = (this.localPlayer as any).walkTextureKey;
+        if (
+          walkTextureKey &&
+          this.localPlayer.texture.key !== walkTextureKey &&
+          this.textures.exists(walkTextureKey)
+        ) {
+          this.localPlayer.setTexture(walkTextureKey);
+        }
+        if (
+          !this.localPlayer.anims.isPlaying ||
+          this.localPlayer.anims.currentAnim?.key !== walkAnimKey
+        ) {
+          this.localPlayer.play(walkAnimKey);
+        }
+        // Still apply subtle bob for extra life
+        this.playerWalkCycle += sprinting ? 0.3 : 0.15;
+        const bobAmount = Math.sin(this.playerWalkCycle) * 2;
+        this.localPlayer.setOrigin(0.5, 1 - bobAmount / 50);
+        this.localPlayer.setScale(baseScale);
+        this.localPlayer.setRotation(0);
+      } else {
+        // No sprite sheet - use procedural bob animation
+        this.playerWalkCycle += sprinting ? 0.45 : 0.25; // Animation speed
+        // Vertical bob (subtle hop)
+        const bobAmount = Math.sin(this.playerWalkCycle) * 3;
+        this.localPlayer.setOrigin(0.5, 1 - bobAmount / 50);
+        // Slight squash/stretch for bounce feel
+        const squash = 1 + Math.sin(this.playerWalkCycle * 2) * 0.03;
+        this.localPlayer.setScale(baseScale * squash, baseScale / squash);
+        // Subtle rotation for swagger
+        const tilt = Math.sin(this.playerWalkCycle) * 0.02;
+        this.localPlayer.setRotation(tilt);
+      }
+    } else {
+      // Reset to idle pose
+      if (hasWalkAnim) {
+        this.localPlayer.stop();
+        // Switch back to the original idle character texture
+        const idleTextureKey = (this.localPlayer as any).idleTextureKey;
+        if (idleTextureKey && this.textures.exists(idleTextureKey)) {
+          this.localPlayer.setTexture(idleTextureKey);
+        }
+      }
+      this.playerWalkCycle = 0;
+      this.localPlayer.setOrigin(0.5, 1);
+      this.localPlayer.setScale(baseScale);
+      this.localPlayer.setRotation(0);
+    }
+
+    // Clamp Y to path area (characters walk on the path)
+    const pathLevel = Y.PATH_LEVEL;
+    const pathMargin = Math.round(30 * SCALE);
+    this.localPlayer.y = Phaser.Math.Clamp(
+      this.localPlayer.y,
+      pathLevel - pathMargin,
+      pathLevel + pathMargin
+    );
+
+    // Sync name label position if present (for meme sprites)
+    const nameLabel = (this.localPlayer as any).nameLabel as Phaser.GameObjects.Text | undefined;
+    if (nameLabel) {
+      nameLabel.setPosition(this.localPlayer.x, this.localPlayer.y + 10);
+    }
+
+    // Emit player position for tutorial spotlight system
+    if (isMoving) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-player-position", {
+          detail: { x: this.localPlayer.x, y: this.localPlayer.y },
+        })
+      );
+    }
+
+    // Keep tutorial arrow positions synced with NPC sprites
+    if (this.tutorialStep === 1 && this.tutorialArrows.length > 0) {
+      this.updateTutorialArrows();
+    }
+
+    // Check zone boundaries for transition
+    this.checkZoneBoundaries();
+
+    // Check NPC and building proximity for interaction
+    this.checkProximityForInteraction();
+
+    // Check for wild creature encounters
+    this.checkCreatureEncounters();
+
+    // Handle E key interaction (NPCs take priority over helper, helper over buildings)
+    if (interact) {
+      if (this.nearbyNPC) {
+        this.interactWithNPC(this.nearbyNPC);
+      } else if (this.nearbyHelper) {
+        this.talkToHelper();
+      } else if (this.nearbyBuilding) {
+        this.interactWithBuilding(this.nearbyBuilding);
+      }
+    }
+  }
+
+  private tutorialStep = -1;
+  private tutorialArrows: Phaser.GameObjects.Text[] = [];
+
+  private initTutorialListener(): void {
+    window.addEventListener("agencity-tutorial-step", ((e: CustomEvent<{ step: number }>) => {
+      const prev = this.tutorialStep;
+      this.tutorialStep = e.detail.step;
+
+      // Clean up arrows when leaving step 1 or when tutorial ends
+      if (prev === 1 && this.tutorialStep !== 1) {
+        this.clearTutorialArrows();
+      }
+
+      // Add bouncing arrows above all NPCs when entering step 1
+      if (this.tutorialStep === 1 && prev !== 1) {
+        this.showTutorialNpcArrows();
+      }
+    }) as EventListener);
+  }
+
+  private showTutorialNpcArrows(): void {
+    this.clearTutorialArrows();
+    this.characterSprites.forEach((sprite) => {
+      if (!sprite.visible) return;
+      const arrow = this.add.text(sprite.x, sprite.y - 45, "\u25BC", {
+        fontSize: "18px",
+        color: "#22c55e",
+        fontFamily: "monospace",
+      });
+      arrow.setOrigin(0.5, 1);
+      arrow.setDepth(200);
+      this.tweens.add({
+        targets: arrow,
+        y: sprite.y - 55,
+        duration: 600,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+      (arrow as any)._tutorialTarget = sprite;
+      this.tutorialArrows.push(arrow);
+    });
+  }
+
+  private updateTutorialArrows(): void {
+    for (const arrow of this.tutorialArrows) {
+      const target = (arrow as any)._tutorialTarget as Phaser.GameObjects.Sprite;
+      if (target && target.active) {
+        arrow.setX(target.x);
+      }
+    }
+  }
+
+  private clearTutorialArrows(): void {
+    for (const arrow of this.tutorialArrows) {
+      this.tweens.killTweensOf(arrow);
+      arrow.destroy();
+    }
+    this.tutorialArrows = [];
+  }
+
+  private checkZoneBoundaries(): void {
+    if (!this.localPlayer || this.isTransitioning) return;
+
+    const x = this.localPlayer.x;
+    const leftEdge = 40;
+    const rightEdge = GAME_WIDTH - 40;
+
+    // Zone order: labs -> moltbook -> main_city -> trending -> ballers -> founders (left to right)
+    const zoneOrder: ZoneType[] = [
+      "labs",
+      "moltbook",
+      "main_city",
+      "trending",
+      "ballers",
+      "founders",
+    ];
+    const currentIndex = zoneOrder.indexOf(this.currentZone);
+
+    if (currentIndex === -1) return; // Safety: unknown zone
+
+    if (x <= leftEdge && currentIndex > 0) {
+      // Transition to previous zone
+      const prevZone = zoneOrder[currentIndex - 1];
+      this.playerTriggerZoneChange(prevZone, "left");
+    } else if (x >= rightEdge && currentIndex < zoneOrder.length - 1) {
+      // Transition to next zone
+      const nextZone = zoneOrder[currentIndex + 1];
+      this.playerTriggerZoneChange(nextZone, "right");
+    }
+  }
+
+  private playerTriggerZoneChange(zone: ZoneType, direction: "left" | "right"): void {
+    // Dispatch zone change event marked as a walk so the router bridge can update the URL.
+    window.dispatchEvent(
+      new CustomEvent("agencity-zone-change", { detail: { zone, source: "walk", direction } })
+    );
+
+    // Move player to opposite edge after transition
+    if (this.localPlayer) {
+      if (direction === "left") {
+        this.localPlayer.x = GAME_WIDTH - 80; // Appear on right side of new zone
+      } else {
+        this.localPlayer.x = 80; // Appear on left side of new zone
+      }
+      // Reset velocity on zone change
+      this.playerVelocity.x = 0;
+      this.playerVelocity.y = 0;
+    }
+  }
+
+  private checkProximityForInteraction(): void {
+    if (!this.localPlayer) return;
+
+    const npcRadius = 80; // Pixels - must be close to interact with NPC
+    const buildingRadius = 120; // Larger radius for buildings (X distance only)
+
+    // Check NPCs first (they take priority)
+    const npcResult: {
+      npc: GameCharacter | null;
+      dist: number;
+      pos: { x: number; y: number } | null;
+    } = {
+      npc: null,
+      dist: Infinity,
+      pos: null,
+    };
+
+    this.characterSprites.forEach((sprite, id) => {
+      const character = this.characterById.get(id);
+      if (!character) return;
+
+      const dist = Phaser.Math.Distance.Between(
+        this.localPlayer!.x,
+        this.localPlayer!.y,
+        sprite.x,
+        sprite.y
+      );
+
+      if (dist < npcRadius && dist < npcResult.dist) {
+        npcResult.dist = dist;
+        npcResult.npc = character;
+        npcResult.pos = { x: sprite.x, y: sprite.y };
+      }
+    });
+
+    this.nearbyNPC = npcResult.npc;
+
+    // NPC Awareness: greet player on first approach
+    if (this.nearbyNPC && this.nearbyNPC !== this.previousNearbyNPC) {
+      this.triggerNPCGreeting(this.nearbyNPC);
+    }
+    this.previousNearbyNPC = this.nearbyNPC;
+
+    // Check buildings (only if no NPC nearby)
+    // Buildings are positioned higher on screen, so use X distance primarily
+    const buildingResult: {
+      building: GameBuilding | null;
+      dist: number;
+      pos: { x: number; y: number } | null;
+    } = {
+      building: null,
+      dist: Infinity,
+      pos: null,
+    };
+
+    if (!this.nearbyNPC) {
+      this.buildingSprites.forEach((container, id) => {
+        // Skip if container is not visible (wrong zone)
+        if (!container.visible) return;
+
+        // Find the building data (O(1) map lookup instead of O(n) array scan)
+        const building = this.buildingById.get(id);
+        if (!building) return;
+
+        // Skip starter buildings (they're non-interactive)
+        if (building.id.startsWith("Starter")) return;
+
+        // Use horizontal distance only - buildings are above the walking path
+        const xDist = Math.abs(this.localPlayer!.x - container.x);
+
+        if (xDist < buildingRadius && xDist < buildingResult.dist) {
+          buildingResult.dist = xDist;
+          buildingResult.building = building;
+          buildingResult.pos = { x: container.x, y: container.y };
+        }
+      });
+
+      // Also check zone-specific popup buildings (HQ, Arcade, Proof, Earnings, Trust)
+      this.zonePopupBuildings.forEach((entry, id) => {
+        if (entry.zone !== this.currentZone || !entry.sprite.active || !entry.sprite.visible) return;
+        const xDist = Math.abs(this.localPlayer!.x - entry.sprite.x);
+        if (xDist < buildingRadius && xDist < buildingResult.dist) {
+          buildingResult.dist = xDist;
+          buildingResult.building = entry.data;
+          buildingResult.pos = { x: entry.sprite.x, y: entry.sprite.y };
+        }
+      });
+    }
+
+    this.nearbyBuilding = buildingResult.building;
+
+    // Check helper NPC (only in the city)
+    this.nearbyHelper = false;
+    if (!this.nearbyNPC && this.helperNPC && this.helperNPC.active && this.helperNPC.visible) {
+      const helperDist = Phaser.Math.Distance.Between(
+        this.localPlayer!.x,
+        this.localPlayer!.y,
+        this.helperNPC.x,
+        this.helperNPC.y
+      );
+      if (helperDist < npcRadius) {
+        this.nearbyHelper = true;
+      }
+    }
+
+    // Update interact prompt visibility and position
+    if (this.interactPrompt) {
+      // On mobile, the floating interact button replaces the text prompt
+      if (this.isMobile) {
+        this.interactPrompt.setVisible(false);
+      } else if (npcResult.npc && npcResult.pos) {
+        this.updateInteractPromptText("Press E to talk");
+        this.interactPrompt.setVisible(true);
+        this.interactPrompt.setPosition(npcResult.pos.x, npcResult.pos.y - 70);
+      } else if (this.nearbyHelper && this.helperNPC) {
+        this.updateInteractPromptText("Press E to talk");
+        this.interactPrompt.setVisible(true);
+        this.interactPrompt.setPosition(this.helperNPC.x, this.helperNPC.y - 70);
+      } else if (buildingResult.building && buildingResult.pos) {
+        this.updateInteractPromptText("Press E to enter");
+        this.interactPrompt.setVisible(true);
+        this.interactPrompt.setPosition(buildingResult.pos.x, buildingResult.pos.y - 120);
+      } else {
+        this.interactPrompt.setVisible(false);
+      }
+    }
+  }
+
+  private updateInteractPromptText(text: string): void {
+    if (!this.interactPrompt) return;
+    const textObj = this.interactPrompt.list[1] as Phaser.GameObjects.Text;
+    if (textObj && textObj.setText) {
+      textObj.setText(text);
+    }
+  }
+
+  private interactWithNPC(character: GameCharacter): void {
+    this.playInteractSfx();
+
+    // Simulate the exact same click behavior as pointerdown handlers
+    // This matches the logic in createCharacterSprite
+
+    const isExternalAgent =
+      character.id.startsWith("external-") || character.id.startsWith("agent-");
+
+    if (isExternalAgent) {
+      // Show tooltip with "Visit Profile" button instead of navigating directly
+      const sprite = this.characterSprites.get(character.id);
+      if (sprite) {
+        this.showCharacterTooltip(character, sprite);
+      }
+    } else if (character.isToly) {
+      window.dispatchEvent(new CustomEvent("agencity-toly-click"));
+    } else if (character.isAsh) {
+      window.dispatchEvent(new CustomEvent("agencity-ash-click"));
+    } else if (character.isFinn) {
+      window.dispatchEvent(new CustomEvent("agencity-finn-click"));
+    } else if (character.isDev) {
+      window.dispatchEvent(new CustomEvent("agencity-dev-click"));
+    } else if (character.isScout) {
+      window.dispatchEvent(new CustomEvent("agencity-scout-click"));
+    } else if (character.isCJ) {
+      window.dispatchEvent(new CustomEvent("agencity-cj-click"));
+    } else if (character.isShaw) {
+      window.dispatchEvent(new CustomEvent("agencity-shaw-click"));
+    } else if (character.isRamo) {
+      window.dispatchEvent(new CustomEvent("agencity-ramo-click"));
+    } else if (character.isSincara) {
+      window.dispatchEvent(new CustomEvent("agencity-sincara-click"));
+    } else if (character.isStuu) {
+      window.dispatchEvent(new CustomEvent("agencity-stuu-click"));
+    } else if (character.isSam) {
+      window.dispatchEvent(new CustomEvent("agencity-sam-click"));
+    } else if (character.isAlaa) {
+      window.dispatchEvent(new CustomEvent("agencity-alaa-click"));
+    } else if (character.isCarlo) {
+      window.dispatchEvent(new CustomEvent("agencity-carlo-click"));
+    } else if (character.isBNN) {
+      window.dispatchEvent(new CustomEvent("agencity-bnn-click"));
+    } else if (character.isProfessorOak) {
+      window.dispatchEvent(new CustomEvent("agencity-professoroak-click"));
+    } else if (character.isCityBot) {
+      window.dispatchEvent(new CustomEvent("agencity-citybot-click"));
+    } else if (character.profileUrl) {
+      // Show tooltip with "Visit Profile" button instead of navigating directly
+      const sprite = this.characterSprites.get(character.id);
+      if (sprite) {
+        this.showCharacterTooltip(character, sprite);
+      }
+    }
+  }
+
+  private interactWithBuilding(building: GameBuilding): void {
+    this.playBuildingClickSfx();
+
+    // Zone-specific popup buildings have their own click handlers registered
+    // in zonePopupBuildings. Use that callback if available.
+    const zonePopup = this.zonePopupBuildings.get(building.id);
+    if (zonePopup) {
+      this.playBuildingClickBurst(zonePopup.sprite.x, zonePopup.sprite.y - 60);
+      zonePopup.onInteract();
+      return;
+    }
+
+    // Visual feedback at the building's visible center. This path has no
+    // pointer event (proximity E-press or tap-to-move arrival), so derive
+    // the position from the sprite container itself.
+    const sprite = this.buildingSprites.get(building.id);
+    if (sprite) {
+      // Containers anchor at the bottom (origin 0.5, 1) — offset upward by
+      // half the hitbox height (~60–100px) so the burst sits over the body
+      // of the building, not at its feet.
+      this.playBuildingClickBurst(sprite.x, sprite.y - 60);
+    }
+
+    // Simulate the exact same click behavior as building pointerdown handlers
+    const isPokeCenter = building.id.includes("PokeCenter");
+    const isCasino = building.id.includes("Casino");
+    const isArcade = building.id.includes("Arcade") || building.symbol === "ARCADE";
+    const isStarterBuilding = building.id.startsWith("Starter");
+    const isTreasuryBuilding = building.id.startsWith("Treasury");
+    const isAgenCityHQ = building.isFloating || building.symbol === "AGENCITY";
+    const isMansionBuilding = building.isMansion;
+
+    if (isMansionBuilding) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-mansion-click", {
+          detail: {
+            name: building.name,
+            holderRank: building.holderRank,
+            holderAddress: building.holderAddress,
+            holderBalance: building.holderBalance,
+          },
+        })
+      );
+    } else if (isPokeCenter) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-pokecenter-click", {
+          detail: { buildingId: building.id, name: building.name },
+        })
+      );
+    } else if (isCasino) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-casino-click", {
+          detail: { buildingId: building.id, name: building.name },
+        })
+      );
+    } else if (isArcade) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-arcade-click", {
+          detail: { buildingId: building.id, name: building.name },
+        })
+      );
+    } else if (isAgenCityHQ) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-building-click", {
+          detail: {
+            mint: building.tokenMint || building.id,
+            symbol: building.symbol || "AGENCITY",
+            name: building.name || "AgenCity HQ",
+            tokenUrl: building.tokenUrl || `https://agencity.app/${building.tokenMint || building.id}`,
+            isPlatform: building.isPlatform || false,
+            platformTheme: building.platformTheme,
+          },
+        })
+      );
+    } else if (isStarterBuilding) {
+      // Starter buildings do nothing - they're placeholders
+    } else if (isTreasuryBuilding) {
+      window.dispatchEvent(
+        new CustomEvent("agencity-treasury-click", {
+          detail: { buildingId: building.id, name: building.name },
+        })
+      );
+    } else {
+      // Regular token buildings
+      window.dispatchEvent(
+        new CustomEvent("agencity-building-click", {
+          detail: {
+            mint: building.tokenMint || building.id,
+            symbol: building.symbol || building.name,
+            name: building.name,
+            tokenUrl: building.tokenUrl,
+            isPlatform: building.isPlatform || false,
+            platformTheme: building.platformTheme,
+          },
+        })
+      );
+    }
+  }
+
+  private setupMobileCameraControls(): void {
+    // Check if mobile
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+    // Enable touch input globally for this scene
+    this.input.setTopOnly(false);
+
+    if (!isMobile) return;
+
+    // Set up camera bounds for panning
+    const camera = this.cameras.main;
+    camera.setBounds(0, 0, GAME_WIDTH, GAME_HEIGHT);
+
+    // Track drag state
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let cameraStartX = 0;
+    let cameraStartY = 0;
+
+    // Track touch start for tap-vs-drag detection (prevents accidental clicks)
+    // Also records the press start timestamp so pointerup can derive long-press sprint intent.
+    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+      this.touchStartPos = { x: pointer.x, y: pointer.y };
+      this.touchStartTime = Date.now();
+      this.wasDragGesture = false;
+    });
+
+    // Handle pointer down - start drag (disabled when player is in world — camera follows player)
+    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
+      if (!this.mobileDragPanEnabled) return;
+      // Only start drag if not clicking on a character/building
+      const hitObjects = this.input.hitTestPointer(pointer);
+      if (hitObjects.length === 0) {
+        isDragging = true;
+        dragStartX = pointer.x;
+        dragStartY = pointer.y;
+        cameraStartX = camera.scrollX;
+        cameraStartY = camera.scrollY;
+      }
+    });
+
+    // Handle pointer move - pan camera + mark drag gesture
+    this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
+      // Mark as drag if finger moved beyond threshold (prevents accidental taps)
+      if (this.touchStartPos && pointer.isDown && !this.wasDragGesture) {
+        const dist = Phaser.Math.Distance.Between(
+          this.touchStartPos.x,
+          this.touchStartPos.y,
+          pointer.x,
+          pointer.y
+        );
+        if (dist > WorldScene.TAP_DISTANCE_THRESHOLD) {
+          this.wasDragGesture = true;
+        }
+      }
+
+      if (!this.mobileDragPanEnabled || !isDragging || !pointer.isDown) return;
+
+      const deltaX = dragStartX - pointer.x;
+      const deltaY = dragStartY - pointer.y;
+
+      // Apply movement scaled by zoom level
+      camera.scrollX = Phaser.Math.Clamp(
+        cameraStartX + deltaX / camera.zoom,
+        0,
+        GAME_WIDTH - camera.width / camera.zoom
+      );
+      camera.scrollY = Phaser.Math.Clamp(
+        cameraStartY + deltaY / camera.zoom,
+        0,
+        GAME_HEIGHT - camera.height / camera.zoom
+      );
+    });
+
+    // Handle pointer up - stop drag + reset wasDragGesture to prevent stale-true
+    this.input.on("pointerup", () => {
+      isDragging = false;
+      this.wasDragGesture = false;
+    });
+
+    // Handle pinch to zoom (two-finger gesture) — disabled in-world
+    let initialPinchDistance = 0;
+    let initialZoom = 1;
+
+    this.input.on("pointerdown", () => {
+      if (this.playerEnabled) return;
+      const pointers = this.input.manager.pointers.filter((p) => p.isDown);
+      if (pointers.length === 2) {
+        initialPinchDistance = Phaser.Math.Distance.Between(
+          pointers[0].x,
+          pointers[0].y,
+          pointers[1].x,
+          pointers[1].y
+        );
+        initialZoom = camera.zoom;
+        isDragging = false;
+      }
+    });
+
+    this.input.on("pointermove", () => {
+      if (this.playerEnabled) return;
+      const pointers = this.input.manager.pointers.filter((p) => p.isDown);
+      if (pointers.length === 2 && initialPinchDistance > 0) {
+        const currentDistance = Phaser.Math.Distance.Between(
+          pointers[0].x,
+          pointers[0].y,
+          pointers[1].x,
+          pointers[1].y
+        );
+        const scale = currentDistance / initialPinchDistance;
+        camera.setZoom(Phaser.Math.Clamp(initialZoom * scale, 0.5, 2));
+      }
+    });
+
+    this.input.on("pointerup", () => {
+      if (this.playerEnabled) return;
+      const pointers = this.input.manager.pointers.filter((p) => p.isDown);
+      if (pointers.length < 2) {
+        initialPinchDistance = 0;
+      }
+    });
+
+    // Double-tap to reset zoom — disabled in-world
+    let lastTapTime = 0;
+    this.input.on("pointerup", () => {
+      if (this.playerEnabled) return;
+      const currentTime = Date.now();
+      if (currentTime - lastTapTime < 300) {
+        camera.setZoom(1);
+        camera.scrollX = 0;
+        camera.scrollY = 0;
+      }
+      lastTapTime = currentTime;
+    });
+
+    // Reset all touch state on system interrupts (incoming call, app switch)
+    this.input.on("pointercancel", () => {
+      this.moveTarget = null;
+      this.moveTargetBuilding = null;
+      this.moveTargetNPC = null;
+      this.wasDragGesture = false;
+      isDragging = false;
+      initialPinchDistance = 0;
+    });
+  }
+
+  private handleZoneChange(event: CustomEvent<{ zone: ZoneType }>): void {
+    const newZone = event.detail.zone;
+    if (newZone === this.currentZone || this.isTransitioning) return;
+
+    // Transition to new zone
+    this.transitionToZone(newZone);
+  }
+
+  private transitionToZone(newZone: ZoneType): void {
+    this.playZoneTransitionSfx();
+
+    // Mark transition in progress and cancel any active tap-to-move
+    this.isTransitioning = true;
+    this.moveTarget = null;
+    this.moveTargetBuilding = null;
+    this.moveTargetNPC = null;
+
+    // Hide helper NPC during transitions; she only lives in the city
+    if (this.helperNPC) {
+      this.helperNPC.setVisible(false);
+      const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
+      if (indicator) indicator.setVisible(false);
+    }
+
+    // Pause camera follow during transition
+    if (this.cameraFollowing) {
+      this.cameras.main.stopFollow();
+    }
+
+    // CLEANUP: Kill any existing transition tweens to prevent accumulation
+    this.decorations.forEach((d) => this.tweens.killTweensOf(d));
+    this.animals.forEach((a) => this.tweens.killTweensOf(a.sprite));
+    this.trendingElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.billboardTexts.forEach((t) => this.tweens.killTweensOf(t));
+    this.skylineSprites.forEach((s) => this.tweens.killTweensOf(s));
+    if (this.tickerText) this.tweens.killTweensOf(this.tickerText);
+    this.ballersElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.foundersElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.labsElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.moltbookElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.arenaElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.ascensionElements.forEach((el) => this.tweens.killTweensOf(el));
+    this.buildingSprites.forEach((container) => this.tweens.killTweensOf(container));
+    this.characterSprites.forEach((sprite) => this.tweens.killTweensOf(sprite));
+
+    // Reset all zone element positions to originals before transition
+    // (slide-out animations corrupt x positions; this ensures correct starting positions)
+    this.decorations.forEach((d) => {
+      const origX = this.originalPositions.get(d);
+      if (origX !== undefined) (d as any).x = origX;
+    });
+    this.animals.forEach((a) => {
+      const origX = this.originalPositions.get(a.sprite);
+      if (origX !== undefined) (a.sprite as any).x = origX;
+    });
+    this.resetZoneElementPositions(this.trendingElements);
+    this.resetZoneElementPositions(this.skylineSprites);
+    this.resetZoneElementPositions(this.billboardTexts);
+    this.resetZoneElementPositions(this.ballersElements);
+    this.resetZoneElementPositions(this.foundersElements);
+    this.resetZoneElementPositions(this.labsElements);
+    this.resetZoneElementPositions(this.moltbookElements);
+    this.resetZoneElementPositions(this.arenaElements);
+    this.resetZoneElementPositions(this.ascensionElements);
+
+    // Determine slide direction: Labs -> Moltbook Beach -> Park -> Catalog -> Ballers Valley -> Founder's Corner -> Arena (left to right)
+    // Zone order: labs (-2) -> moltbook (-1) -> main_city (0) -> trending (1) -> ballers (2) -> founders (3) -> arena (4)
+    const zoneOrder: Record<ZoneType, number> = {
+      labs: -2,
+      moltbook: -1,
+      main_city: 0,
+      trending: 1,
+      ballers: 2,
+      founders: 3,
+      arena: 4,
+      ascension: 5,
+    };
+    const isGoingRight = zoneOrder[newZone] > zoneOrder[this.currentZone];
+    const isAscensionTransition = newZone === "ascension" || this.currentZone === "ascension";
+    const isVerticalTransition = isAscensionTransition;
+    const duration = isVerticalTransition ? 800 : 600; // Slower, dramatic for vertical transitions
+    const slideDistance = Math.round(850 * SCALE); // Slightly more than screen width for full slide (scaled)
+
+    // For ascension: vertical transition (ascend)
+    // For all others: horizontal slide
+    const slideOutOffset = isVerticalTransition ? 0 : isGoingRight ? -slideDistance : slideDistance;
+    const slideInOffset = isVerticalTransition ? 0 : isGoingRight ? slideDistance : -slideDistance;
+
+    // Collect current zone elements to slide out
+    const oldElements: (Phaser.GameObjects.GameObject & { x?: number })[] = [];
+
+    if (this.currentZone === "trending") {
+      oldElements.push(...this.trendingElements);
+      oldElements.push(...this.billboardTexts);
+      if (this.tickerText) oldElements.push(this.tickerText);
+      oldElements.push(...this.skylineSprites);
+    } else if (this.currentZone === "ballers") {
+      oldElements.push(...this.ballersElements);
+    } else if (this.currentZone === "founders") {
+      oldElements.push(...this.foundersElements);
+    } else if (this.currentZone === "labs") {
+      oldElements.push(...this.labsElements);
+    } else if (this.currentZone === "moltbook") {
+      oldElements.push(...this.moltbookElements);
+    } else if (this.currentZone === "arena") {
+      oldElements.push(...this.arenaElements);
+    } else if (this.currentZone === "ascension") {
+      oldElements.push(...this.ascensionElements);
+    } else {
+      // Main city (Park) decorations
+      this.decorations.forEach((d) => oldElements.push(d));
+      this.animals.forEach((a) => oldElements.push(a.sprite));
+    }
+
+    // Snapshot building/character sprite IDs at transition start
+    // Only these will be destroyed after transition — sprites created mid-transition by worldState updates are preserved
+    const oldBuildingSpriteIds = new Set(this.buildingSprites.keys());
+    const oldCharacterSpriteIds = new Set(this.characterSprites.keys());
+
+    // Include buildings and characters (they slide out and get recreated)
+    this.buildingSprites.forEach((container) => oldElements.push(container));
+    this.characterSprites.forEach((sprite) => oldElements.push(sprite));
+
+    // Store old element original X positions for proper destruction
+    const oldElementData = oldElements.map((el) => ({ el, origX: (el as any).x || 0 }));
+
+    // Create transition overlay for ground swap (slides with content, scaled)
+    const transitionOverlay = this.add.rectangle(
+      GAME_WIDTH / 2 + slideInOffset,
+      Math.round(520 * SCALE),
+      GAME_WIDTH,
+      Math.round(200 * SCALE),
+      {
+        trending: 0x374151,
+        labs: 0x1a1a2e,
+        arena: 0x2d1b4e,
+        ascension: 0xe8e8f0,
+        moltbook: 0xc2b280,
+        ballers: 0x22c55e,
+        founders: 0x8b6914,
+        main_city: 0x22c55e,
+      }[this.currentZone] || 0x22c55e, // Zone-appropriate ground color
+      1
+    );
+    transitionOverlay.setDepth(0);
+
+    if (isAscensionTransition) {
+      const verticalDist = Math.round(600 * SCALE);
+      const isEnteringAscension = newZone === "ascension";
+
+      // Entering ascension (flying up): old elements slide DOWN (world drops away)
+      // Leaving ascension (descending): old elements slide UP (world rises away)
+      const verticalDelta = isEnteringAscension ? verticalDist : -verticalDist;
+      oldElementData.forEach(({ el }) => {
+        if ((el as any).y !== undefined) {
+          this.tweens.add({
+            targets: el,
+            y: (el as any).y + verticalDelta,
+            alpha: 0,
+            duration,
+            ease: "Cubic.easeIn",
+          });
+          // Slide character drop shadow with its sprite so it doesn't lag
+          const shadow = (el as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+          if (shadow && shadow.active) {
+            this.tweens.add({
+              targets: shadow,
+              y: shadow.y + verticalDelta,
+              alpha: 0,
+              duration,
+              ease: "Cubic.easeIn",
+            });
+          }
+        }
+      });
+
+      // Ground fades during transition
+      this.tweens.add({
+        targets: this.ground,
+        alpha: 0,
+        duration: duration * 0.4,
+        ease: "Cubic.easeIn",
+        onComplete: () => {
+          this.ground.setAlpha(1);
+        },
+      });
+
+      // Sky-colored overlay (celestial cream-white, matching ascension cloud floor)
+      transitionOverlay.setFillStyle(0xfff8e8, 1);
+      transitionOverlay.setPosition(GAME_WIDTH / 2, GAME_HEIGHT / 2);
+      transitionOverlay.setSize(GAME_WIDTH, GAME_HEIGHT);
+      transitionOverlay.setAlpha(0);
+      transitionOverlay.setDepth(50);
+
+      // Cloud wisps drifting during the sky transition
+      const cloudWisps: Phaser.GameObjects.Ellipse[] = [];
+      const cloudDirection = isEnteringAscension ? 1 : -1; // Down when flying up, up when descending
+
+      for (let i = 0; i < 7; i++) {
+        const w = Math.round((60 + Math.random() * 120) * SCALE);
+        const h = Math.round((15 + Math.random() * 25) * SCALE);
+        const startX = Math.random() * GAME_WIDTH;
+        const startY = Math.random() * GAME_HEIGHT;
+        const cloud = this.add.ellipse(
+          startX,
+          startY,
+          w,
+          h,
+          i % 3 === 0 ? 0xfff0c8 : 0xffffff, // Mix white + pale gold
+          0.4 + Math.random() * 0.3
+        );
+        cloud.setDepth(51);
+        cloud.setAlpha(0);
+        cloudWisps.push(cloud);
+
+        this.tweens.add({
+          targets: cloud,
+          alpha: 0.3 + Math.random() * 0.4,
+          y: startY + cloudDirection * Math.round((80 + Math.random() * 200) * SCALE),
+          x: startX + Math.round((Math.random() - 0.5) * 100 * SCALE),
+          duration: duration * 0.8,
+          ease: "Sine.easeInOut",
+          delay: Math.random() * 150,
+          onComplete: () => {
+            this.tweens.add({
+              targets: cloud,
+              alpha: 0,
+              duration: 200,
+              onComplete: () => cloud.destroy(),
+            });
+          },
+        });
+      }
+
+      // Main overlay fade
+      this.tweens.add({
+        targets: transitionOverlay,
+        alpha: 1,
+        duration: duration * 0.5,
+        ease: "Cubic.easeIn",
+        yoyo: true,
+        hold: duration * 0.15,
+        onComplete: () => {
+          transitionOverlay.destroy();
+          cloudWisps.forEach((c) => {
+            if (c.active) c.destroy();
+          });
+        },
+      });
+    } else {
+      // Standard horizontal slide
+      oldElementData.forEach(({ el }) => {
+        if ((el as any).x !== undefined) {
+          this.tweens.add({
+            targets: el,
+            x: (el as any).x + slideOutOffset,
+            duration,
+            ease: "Cubic.easeInOut",
+          });
+          // Slide character drop shadow with its sprite so it doesn't lag
+          const shadow = (el as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+          if (shadow && shadow.active) {
+            this.tweens.add({
+              targets: shadow,
+              x: shadow.x + slideOutOffset,
+              duration,
+              ease: "Cubic.easeInOut",
+            });
+          }
+        }
+      });
+
+      // Slide ground texture overlay (scaled)
+      this.tweens.add({
+        targets: this.ground,
+        tilePositionX:
+          this.ground.tilePositionX +
+          (isGoingRight ? Math.round(100 * SCALE) : -Math.round(100 * SCALE)),
+        duration,
+        ease: "Cubic.easeInOut",
+      });
+
+      // Slide transition overlay in, destroy when complete
+      this.tweens.add({
+        targets: transitionOverlay,
+        x: GAME_WIDTH / 2,
+        duration,
+        ease: "Cubic.easeInOut",
+        onComplete: () => {
+          transitionOverlay.destroy();
+        },
+      });
+    }
+
+    // At 40% through animation, swap the zone for smooth visual transition
+    this.time.delayedCall(duration * 0.4, () => {
+      // Hide old zone elements (don't destroy - they're cached for reuse)
+      if (this.currentZone === "trending") {
+        this.trendingElements.forEach((el) => (el as any).setVisible(false));
+        this.billboardTexts.forEach((t) => t.setVisible(false));
+        if (this.tickerText) this.tickerText.setVisible(false);
+        this.skylineSprites.forEach((s) => s.setVisible(false));
+        // Stop ticker animation
+        if (this.tickerTimer) {
+          this.tickerTimer.destroy();
+          this.tickerTimer = null;
+        }
+        // Stop billboard update timer
+        if (this.billboardTimer) {
+          this.billboardTimer.destroy();
+          this.billboardTimer = null;
+        }
+        // Stop traffic timers
+        clearTrafficTimers(this);
+      } else if (this.currentZone === "ballers") {
+        this.ballersElements.forEach((el) => (el as any).setVisible(false));
+      } else if (this.currentZone === "founders") {
+        this.foundersElements.forEach((el) => (el as any).setVisible(false));
+      } else if (this.currentZone === "labs") {
+        this.labsElements.forEach((el) => (el as any).setVisible(false));
+      } else if (this.currentZone === "moltbook") {
+        this.moltbookElements.forEach((el) => (el as any).setVisible(false));
+      } else if (this.currentZone === "arena") {
+        this.arenaElements.forEach((el) => (el as any).setVisible(false));
+        disconnectArena(this);
+      } else if (this.currentZone === "ascension") {
+        this.ascensionElements.forEach((el) => (el as any).setVisible(false));
+        disconnectAscension(this);
+      }
+
+      // Update zone and set up new content
+      this.currentZone = newZone;
+
+      // Reset NPC greeting state on zone change
+      this.previousNearbyNPC = null;
+      this.npcGreetZoneEntryTime = Date.now();
+
+      // Sync zone to Zustand store (used by ImmersiveHUD)
+      window.dispatchEvent(
+        new CustomEvent("agencity-phaser-zone-change", { detail: { zone: newZone } })
+      );
+
+      // Change ground texture based on zone
+      const groundTextures: Record<ZoneType, string> = {
+        labs: "labs_ground", // Tech Labs has futuristic floor tiles
+        moltbook: "beach_ground", // Moltbook Beach has sand
+        main_city: "grass",
+        trending: "concrete",
+        ballers: "grass", // Ballers Valley has premium grass (luxury estate feel)
+        founders: "founders_ground", // Founder's Corner has warm workshop flooring
+        arena: "arena_floor", // MoltBook Arena has dark checkerboard floor
+        ascension: "ascension_cloud_ground", // Ascension Spire has bright cloud-tile floor
+      };
+      this.ground.setTexture(groundTextures[newZone]);
+
+      // Setup new zone content (will be positioned off-screen initially)
+      this.setupZoneOffscreen(newZone, slideInOffset);
+    });
+
+    // Clean up old elements after animation completes
+    this.time.delayedCall(duration + 50, () => {
+      oldElementData.forEach(({ el }) => {
+        // Only destroy elements that aren't persistent (zone elements are reused)
+        const isDecoration = this.decorations.includes(el as any);
+        const isAnimal = this.animals.some((a) => a.sprite === el);
+        const isTrendingElement =
+          this.trendingElements.includes(el) ||
+          this.skylineSprites.includes(el as any) ||
+          this.billboardTexts.includes(el as any) ||
+          el === this.tickerText;
+        const isBallersElement = this.ballersElements.includes(el);
+        const isFoundersElement = this.foundersElements.includes(el);
+        const isMoltbookElement = this.moltbookElements.includes(el);
+        const isLabsElement = this.labsElements.includes(el);
+        const isArenaElement = this.arenaElements.includes(el);
+        const isAscensionElement = this.ascensionElements.includes(el);
+
+        if (
+          !isDecoration &&
+          !isAnimal &&
+          !isTrendingElement &&
+          !isBallersElement &&
+          !isFoundersElement &&
+          !isMoltbookElement &&
+          !isLabsElement &&
+          !isArenaElement &&
+          !isAscensionElement &&
+          el &&
+          (el as any).destroy &&
+          (el as any).active !== false
+        ) {
+          (el as any).destroy();
+        }
+      });
+
+      // Only clear building/character sprites that existed at transition start
+      // Sprites created mid-transition by worldState updates are preserved
+      oldBuildingSpriteIds.forEach((id) => {
+        const sprite = this.buildingSprites.get(id);
+        if (sprite && (sprite as any).active !== false) {
+          (sprite as any).destroy();
+        }
+        this.buildingSprites.delete(id);
+      });
+      oldCharacterSpriteIds.forEach((id) => {
+        const sprite = this.characterSprites.get(id);
+        if (sprite && (sprite as any).active !== false) {
+          // Destroy attached drop shadow before the sprite itself
+          const shadow = (sprite as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+          if (shadow) {
+            shadow.destroy();
+            (sprite as any)._shadow = null;
+          }
+          (sprite as any).destroy();
+        }
+        this.characterSprites.delete(id);
+      });
+
+      // CRITICAL: Immediately recreate sprites from existing worldState
+      // Without this, sprites stay destroyed until next React Query poll (up to 60s)
+      if (this.worldState) {
+        this.updateCharacters(this.worldState.population);
+        this.updateBuildings(this.worldState.buildings);
+      }
+
+      // Mark transition complete
+      this.isTransitioning = false;
+
+      // Resume camera follow after transition
+      if (this.cameraFollowing && this.localPlayer) {
+        this.cameras.main.startFollow(this.localPlayer, true, 0.08, 0.08);
+        this.cameras.main.setDeadzone(30, 15);
+      }
+
+      // Flush any pending player spawn that was queued during this transition
+      if (this.pendingEnterWorld) {
+        const pending = this.pendingEnterWorld;
+        this.pendingEnterWorld = null;
+        pending();
+      }
+
+      // Show helper NPC only when the player is back in the city
+      if (this.helperNPC) {
+        const inCity = this.currentZone === "main_city";
+        this.helperNPC.setVisible(inCity);
+        const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
+        if (indicator) indicator.setVisible(inCity);
+      }
+    });
+  }
+
+  private setupZoneOffscreen(zone: ZoneType, offsetX: number): void {
+    // Hide all zone elements once, before setting up the new zone
+    this.hideAllZoneElements();
+
+    // Ensure ground is visible by default (zones that need it hidden will override)
+    this.ground.setVisible(true);
+    if (this.groundPath) this.groundPath.setVisible(true);
+    if (this.groundTransition) this.groundTransition.setVisible(true);
+
+    // Setup zone with elements offset, then animate them into position
+    const duration = 400; // Smooth slide-in matching the overall transition feel
+
+    if (zone === "trending") {
+      setupTrendingZone(this);
+
+      // Offset all new Catalog elements and animate them in
+      const newElements = [
+        ...this.trendingElements,
+        ...this.billboardTexts,
+        this.tickerText,
+        ...this.skylineSprites,
+      ].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).x !== undefined) {
+          const targetX = (el as any).x;
+          (el as any).x = targetX + offsetX;
+          this.tweens.add({
+            targets: el,
+            x: targetX,
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    } else if (zone === "ballers") {
+      setupBallersZone(this);
+
+      // Offset all new Ballers Valley elements and animate them in
+      const newElements = [...this.ballersElements].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).x !== undefined) {
+          const targetX = (el as any).x;
+          (el as any).x = targetX + offsetX;
+          this.tweens.add({
+            targets: el,
+            x: targetX,
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    } else if (zone === "founders") {
+      setupFoundersZone(this);
+
+      // Offset all new Founder's Corner elements and animate them in
+      const newElements = [...this.foundersElements].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).x !== undefined) {
+          const targetX = (el as any).x;
+          (el as any).x = targetX + offsetX;
+          this.tweens.add({
+            targets: el,
+            x: targetX,
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    } else if (zone === "labs") {
+      setupLabsZone(this);
+
+      // Offset all new Tech Labs elements and animate them in
+      const newElements = [...this.labsElements].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).x !== undefined) {
+          const targetX = (el as any).x;
+          (el as any).x = targetX + offsetX;
+          this.tweens.add({
+            targets: el,
+            x: targetX,
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    } else if (zone === "moltbook") {
+      setupMoltbookZone(this);
+
+      // Offset all new Moltbook Beach elements and animate them in
+      const newElements = [...this.moltbookElements].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).x !== undefined) {
+          const targetX = (el as any).x;
+          (el as any).x = targetX + offsetX;
+          this.tweens.add({
+            targets: el,
+            x: targetX,
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    } else if (zone === "arena") {
+      setupArenaZone(this);
+
+      // Offset all new Arena elements and animate them in
+      const newElements = [...this.arenaElements].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).x !== undefined) {
+          const targetX = (el as any).x;
+          (el as any).x = targetX + offsetX;
+          this.tweens.add({
+            targets: el,
+            x: targetX,
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    } else if (zone === "ascension") {
+      setupAscensionZone(this);
+
+      // Ascension elements rise from below (upward float-in)
+      const verticalDist = Math.round(300 * SCALE);
+      const newElements = [...this.ascensionElements].filter(Boolean);
+
+      newElements.forEach((el) => {
+        if ((el as any).y !== undefined) {
+          const targetY = (el as any).y;
+          (el as any).y = targetY + verticalDist;
+          (el as any).alpha = 0;
+          this.tweens.add({
+            targets: el,
+            y: targetY,
+            alpha: 1,
+            duration: 600,
+            ease: "Cubic.easeOut",
+            delay: Math.random() * 200,
+          });
+        }
+      });
+    } else {
+      setupMainCityZone(this);
+
+      // Animate Park elements in using their ORIGINAL positions
+      const newElements = [...this.decorations, ...this.animals.map((a) => a.sprite)];
+
+      newElements.forEach((el) => {
+        // Get the original position, not the current (off-screen) position
+        const originalX = this.originalPositions.get(el);
+        if (originalX !== undefined) {
+          (el as any).x = originalX + offsetX; // Start off-screen
+          this.tweens.add({
+            targets: el,
+            x: originalX, // Animate to original position
+            duration,
+            ease: "Cubic.easeOut",
+          });
+        }
+      });
+    }
+  }
+
+  private storeOriginalPositions(): void {
+    // Store original X positions of decorations and animals for zone transitions
+    this.decorations.forEach((d) => {
+      this.originalPositions.set(d, (d as any).x || 0);
+    });
+    this.animals.forEach((a) => {
+      this.originalPositions.set(a.sprite, (a.sprite as any).x || 0);
+    });
+  }
+
+  /**
+   * Store original X positions for zone elements that participate in slide animations.
+   * Called after zone elements are first created so positions can be restored
+   * before the next slide-out/slide-in cycle.
+   */
+  public storeZoneElementPositions(elements: Phaser.GameObjects.GameObject[]): void {
+    elements.forEach((el) => {
+      if ((el as any).x !== undefined) {
+        this.originalPositions.set(el, (el as any).x);
+      }
+    });
+  }
+
+  /**
+   * Reset zone elements to their original X positions (counteracts slide-out corruption).
+   */
+  private resetZoneElementPositions(elements: Phaser.GameObjects.GameObject[]): void {
+    elements.forEach((el) => {
+      const origX = this.originalPositions.get(el);
+      if (origX !== undefined) (el as any).x = origX;
+    });
+  }
+
+  private clearCurrentZone(): void {
+    // Clear zone-specific elements based on current zone
+    if (this.currentZone === "trending") {
+      // Just hide elements instead of destroying (they're cached for reuse)
+      this.trendingElements.forEach((el) => (el as any).setVisible(false));
+      this.billboardTexts.forEach((t) => t.setVisible(false));
+      if (this.tickerText) {
+        this.tickerText.setVisible(false);
+      }
+      if (this.tickerTimer) {
+        this.tickerTimer.destroy();
+        this.tickerTimer = null;
+      }
+      this.skylineSprites.forEach((s) => s.setVisible(false));
+    } else if (this.currentZone === "ballers") {
+      // Hide ballers elements
+      this.ballersElements.forEach((el) => (el as any).setVisible(false));
+    } else if (this.currentZone === "founders") {
+      // Hide founders elements
+      this.foundersElements.forEach((el) => (el as any).setVisible(false));
+    } else if (this.currentZone === "labs") {
+      // Hide labs elements
+      this.labsElements.forEach((el) => (el as any).setVisible(false));
+    } else if (this.currentZone === "arena") {
+      // Hide arena elements and disconnect WebSocket
+      this.arenaElements.forEach((el) => (el as any).setVisible(false));
+      disconnectArena(this);
+    } else if (this.currentZone === "ascension") {
+      // Hide ascension elements and stop polling
+      this.ascensionElements.forEach((el) => (el as any).setVisible(false));
+      disconnectAscension(this);
+    } else if (this.currentZone === "main_city") {
+      // Main city uses shared decorations, don't destroy them
+      // Just hide them
+      this.decorations.forEach((d) => d.setVisible(false));
+      this.animals.forEach((a) => a.sprite.setVisible(false));
+      if (this.helperNPC) {
+        this.helperNPC.setVisible(false);
+        const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
+        if (indicator) indicator.setVisible(false);
+      }
+    }
+
+    // Reset ground
+    if (this.zoneGround) {
+      this.zoneGround.destroy();
+      this.zoneGround = null;
+    }
+    if (this.zonePath) {
+      this.zonePath.destroy();
+      this.zonePath = null;
+    }
+  }
+
+  /**
+   * Hide all zone-specific elements in a single pass.
+   * Called once before setting up a new zone, replacing the duplicated
+   * hide-everything blocks that were copied into each setup method.
+   */
+  private hideAllZoneElements(): void {
+    this.decorations.forEach((d) => d.setVisible(false));
+    this.animals.forEach((a) => a.sprite.setVisible(false));
+    if (this.fountainWater) this.fountainWater.setVisible(false);
+    this.trendingElements.forEach((el) => (el as any).setVisible(false));
+    this.skylineSprites.forEach((s) => s.setVisible(false));
+    this.billboardTexts.forEach((t) => t.setVisible(false));
+    if (this.tickerText) this.tickerText.setVisible(false);
+    this.academyElements.forEach((el) => (el as any).setVisible(false));
+    this.academyBuildings.forEach((s) => s.setVisible(false));
+    this.ballersElements.forEach((el) => (el as any).setVisible(false));
+    this.foundersElements.forEach((el) => (el as any).setVisible(false));
+    this.labsElements.forEach((el) => (el as any).setVisible(false));
+    this.moltbookElements.forEach((el) => (el as any).setVisible(false));
+    this.arenaElements.forEach((el) => (el as any).setVisible(false));
+    this.ascensionElements.forEach((el) => (el as any).setVisible(false));
+    disconnectArena(this);
+    disconnectAscension(this);
+    if (this.helperNPC) {
+      this.helperNPC.setVisible(false);
+      const indicator = (this.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
+      if (indicator) indicator.setVisible(false);
+    }
+    if (this.foundersPopup) {
+      this.foundersPopup.destroy();
+      this.foundersPopup = null;
+    }
+  }
+
+  private setupZone(zone: ZoneType): void {
+    switch (zone) {
+      case "labs":
+        setupLabsZone(this);
+        break;
+      case "moltbook":
+        setupMoltbookZone(this);
+        break;
+      case "trending":
+        setupTrendingZone(this);
+        break;
+      case "ballers":
+        setupBallersZone(this);
+        break;
+      case "founders":
+        setupFoundersZone(this);
+        break;
+      case "arena":
+        setupArenaZone(this);
+        break;
+      case "ascension":
+        setupAscensionZone(this);
+        break;
+      case "main_city":
+      default:
+        setupMainCityZone(this);
+        break;
+    }
+  }
+
+  // Handle AI behavior commands for characters
+  private handleBehaviorCommand(event: CustomEvent): void {
+    const command = event.detail;
+    if (!command || !command.characterId) return;
+
+    const characterId = command.characterId;
+    let targetX: number | undefined;
+    let targetY: number | undefined;
+
+    // Determine target position based on command
+    if (command.target) {
+      if (command.target.type === "position" && command.target.x !== undefined) {
+        targetX = command.target.x;
+        targetY = command.target.y || Math.round(570 * SCALE);
+      } else if (command.target.type === "character" && command.target.id) {
+        // Find target character's position
+        const targetSprite = this.findCharacterSprite(command.target.id);
+        if (targetSprite) {
+          // Move near the character, not exactly on top
+          const offset = (Math.random() - 0.5) * 100;
+          targetX = targetSprite.x + offset;
+          targetY = targetSprite.y + (Math.random() - 0.5) * 30;
+        }
+      } else if (command.target.type === "building" && command.target.id) {
+        // Find building position
+        const building = this.buildingSprites.get(command.target.id);
+        if (building) {
+          targetX = building.x + (Math.random() - 0.5) * 80;
+          targetY = Math.round(580 * SCALE); // Stay on path
+        }
+      }
+    }
+
+    // If we have a valid target, store it
+    if (targetX !== undefined && targetY !== undefined) {
+      // Clamp to valid bounds
+      targetX = Math.max(100, Math.min(1180, targetX));
+      targetY = Math.max(Math.round(450 * SCALE), Math.min(Math.round(620 * SCALE), targetY));
+
+      this.characterTargets.set(characterId, {
+        x: targetX,
+        y: targetY,
+        action: command.action || "moveTo",
+      });
+    } else if (command.action === "idle" || command.action === "observe") {
+      // Clear target for idle/observe
+      this.characterTargets.delete(characterId);
+    }
+  }
+
+  // Find a character sprite by character ID (handles special character naming)
+  private findCharacterSprite(characterId: string): Phaser.GameObjects.Sprite | null {
+    // Direct lookup
+    const direct = this.characterSprites.get(characterId);
+    if (direct) return direct;
+
+    // Search by special character flags
+    for (const [, sprite] of this.characterSprites) {
+      const spriteData = sprite as any;
+      // Core characters
+      if (characterId === "finn" && spriteData.isFinn) return sprite;
+      if (characterId === "ghost" && spriteData.isDev) return sprite;
+      if (characterId === "neo" && spriteData.isScout) return sprite;
+      if (characterId === "ash" && spriteData.isAsh) return sprite;
+      if (characterId === "toly" && spriteData.isToly) return sprite;
+      if (characterId === "cj" && spriteData.isCJ) return sprite;
+      if (characterId === "shaw" && spriteData.isShaw) return sprite;
+      // Academy Zone - AgenC Team
+      if (characterId === "ramo" && spriteData.isRamo) return sprite;
+      if (characterId === "sincara" && spriteData.isSincara) return sprite;
+      if (characterId === "stuu" && spriteData.isStuu) return sprite;
+      if (characterId === "sam" && spriteData.isSam) return sprite;
+      if (characterId === "alaa" && spriteData.isAlaa) return sprite;
+      if (characterId === "carlo" && spriteData.isCarlo) return sprite;
+      if (characterId === "bnn" && spriteData.isBNN) return sprite;
+      // Founder's Corner Zone
+      if (characterId === "professorOak" && spriteData.isProfessorOak) return sprite;
+      // Mascots
+      if (characterId === "citybot" && spriteData.isCityBot) return sprite;
+    }
+
+    return null;
+  }
+
+  // Public method to get character sprite (for agent bridge)
+  getCharacterSprite(characterId: string): Phaser.GameObjects.Sprite | null {
+    return this.findCharacterSprite(characterId);
+  }
+
+  // Map a character to their behavior system ID
+  private getCharacterBehaviorId(character: GameCharacter): string {
+    // Core characters
+    if (character.isFinn) return "finn";
+    if (character.isDev) return "ghost";
+    if (character.isScout) return "neo";
+    if (character.isAsh) return "ash";
+    if (character.isToly) return "toly";
+    if (character.isCJ) return "cj";
+    if (character.isShaw) return "shaw";
+    // Academy Zone - AgenC Team
+    if (character.isRamo) return "ramo";
+    if (character.isSincara) return "sincara";
+    if (character.isStuu) return "stuu";
+    if (character.isSam) return "sam";
+    if (character.isAlaa) return "alaa";
+    if (character.isCarlo) return "carlo";
+    if (character.isBNN) return "bnn";
+    // Founder's Corner Zone
+    if (character.isProfessorOak) return "professorOak";
+    // Mascots
+    if (character.isCityBot) return "citybot";
+    return character.id;
+  }
+
+  // Update glow sprite positions when character moves
+  private updateCharacterGlow(sprite: Phaser.GameObjects.Sprite, character: GameCharacter): void {
+    const spriteData = sprite as any;
+
+    // Update glow position to follow sprite
+    if (character.isToly && spriteData.tolyGlow) {
+      spriteData.tolyGlow.x = sprite.x;
+      spriteData.tolyGlow.y = sprite.y;
+    }
+    if (character.isAsh && spriteData.ashGlow) {
+      spriteData.ashGlow.x = sprite.x;
+      spriteData.ashGlow.y = sprite.y;
+    }
+    if (character.isFinn && spriteData.finnGlow) {
+      spriteData.finnGlow.x = sprite.x;
+      spriteData.finnGlow.y = sprite.y;
+    }
+    if (character.isDev && spriteData.devGlow) {
+      spriteData.devGlow.x = sprite.x;
+      spriteData.devGlow.y = sprite.y;
+    }
+    if (character.isScout && spriteData.scoutGlow) {
+      spriteData.scoutGlow.x = sprite.x;
+      spriteData.scoutGlow.y = sprite.y;
+    }
+    if (character.isCJ && spriteData.cjGlow) {
+      spriteData.cjGlow.x = sprite.x;
+      spriteData.cjGlow.y = sprite.y;
+    }
+    if (character.isShaw && spriteData.shawGlow) {
+      spriteData.shawGlow.x = sprite.x;
+      spriteData.shawGlow.y = sprite.y;
+    }
+    // Academy Zone - AgenC Team
+    if (character.isRamo && spriteData.ramoGlow) {
+      spriteData.ramoGlow.x = sprite.x;
+      spriteData.ramoGlow.y = sprite.y;
+    }
+    if (character.isSincara && spriteData.sincaraGlow) {
+      spriteData.sincaraGlow.x = sprite.x;
+      spriteData.sincaraGlow.y = sprite.y;
+    }
+    if (character.isStuu && spriteData.stuuGlow) {
+      spriteData.stuuGlow.x = sprite.x;
+      spriteData.stuuGlow.y = sprite.y;
+    }
+    if (character.isSam && spriteData.samGlow) {
+      spriteData.samGlow.x = sprite.x;
+      spriteData.samGlow.y = sprite.y;
+    }
+    if (character.isAlaa && spriteData.alaaGlow) {
+      spriteData.alaaGlow.x = sprite.x;
+      spriteData.alaaGlow.y = sprite.y;
+    }
+    if (character.isCarlo && spriteData.carloGlow) {
+      spriteData.carloGlow.x = sprite.x;
+      spriteData.carloGlow.y = sprite.y;
+    }
+    if (character.isBNN && spriteData.bnnGlow) {
+      spriteData.bnnGlow.x = sprite.x;
+      spriteData.bnnGlow.y = sprite.y;
+    }
+    // Founder's Corner characters
+    if (character.isProfessorOak && spriteData.professorOakGlow) {
+      spriteData.professorOakGlow.x = sprite.x;
+      spriteData.professorOakGlow.y = sprite.y;
+    }
+    // Mascots
+    if (character.isCityBot && spriteData.citybotGlow) {
+      spriteData.citybotGlow.x = sprite.x;
+      spriteData.citybotGlow.y = sprite.y;
+    }
+    // External agents (OpenClaws) and spawned agents (ElizaOS)
+    if (
+      (character.id.startsWith("external-") || character.id.startsWith("agent-")) &&
+      spriteData.openClawGlow
+    ) {
+      spriteData.openClawGlow.x = sprite.x;
+      spriteData.openClawGlow.y = sprite.y;
+    }
+  }
+
+  // Update mobile label position to follow sprite movement
+  // Throttled: only repositions when character has moved >= 8px from last update
+  // Also hides label dynamically if it overlaps another visible label
+  private updateMobileLabel(sprite: Phaser.GameObjects.Sprite): void {
+    const s = sprite as any;
+    if (!s._mobileLabel) return;
+
+    // Skip update if sprite hasn't moved enough (8^2 = 64px² threshold)
+    const dx = sprite.x - (s._labelLastX ?? -999);
+    const dy = sprite.y - (s._labelLastY ?? -999);
+    if (dx * dx + dy * dy < 64) return;
+
+    s._labelLastX = sprite.x;
+    s._labelLastY = sprite.y;
+    const offset = s._mobileLabelOffset || 18;
+    const newX = sprite.x;
+    const newY = sprite.y + offset;
+    s._mobileLabel.setPosition(newX, newY);
+    if (s._mobileLabelBg) s._mobileLabelBg.setPosition(newX, newY);
+
+    // Dynamic collision check: hide label if it now overlaps another visible label
+    let overlaps = false;
+    const myBg = s._mobileLabelBg as Phaser.GameObjects.Rectangle | undefined;
+    if (myBg) {
+      for (const otherSprite of this.characterSprites.values()) {
+        if (otherSprite === sprite) continue;
+        const otherBg = (otherSprite as any)._mobileLabelBg as
+          | Phaser.GameObjects.Rectangle
+          | undefined;
+        if (!otherBg || !otherBg.active || !otherBg.visible) continue;
+        const odx = Math.abs(newX - otherBg.x);
+        const ody = Math.abs(newY - otherBg.y);
+        if (odx < myBg.width / 2 + otherBg.width / 2 + 4 && ody < 12) {
+          overlaps = true;
+          break;
+        }
+      }
+    }
+    s._mobileLabel.setVisible(!overlaps);
+    if (s._mobileLabelBg) s._mobileLabelBg.setVisible(!overlaps);
+  }
+
+  // Update visitor sparkle indicator position
+  private updateVisitorSparkle(sprite: Phaser.GameObjects.Sprite): void {
+    const sparkle = (sprite as any)._visitorSparkle;
+    if (sparkle) sparkle.setPosition(sprite.x, sprite.y - 22);
+  }
+
+  // Handle character speak events (from AI behavior)
+  private handleCharacterSpeak(event: CustomEvent): void {
+    const { characterId, message, emotion } = event.detail;
+    if (!characterId || !message || !this.speechBubbleManager) return;
+
+    // Sanitize: skip raw JSON/code strings that leak from AI responses
+    const msg = typeof message === "string" ? message : String(message);
+    if (
+      msg.startsWith("{") ||
+      msg.startsWith("[") ||
+      msg.startsWith("<") ||
+      msg.includes('"type"') ||
+      msg.includes("```")
+    )
+      return;
+
+    // Truncate overly long messages
+    const cleanMessage = msg.length > 120 ? msg.slice(0, 117) + "..." : msg;
+
+    // Don't interrupt autonomous dialogue conversations
+    const activeConversation = getActiveConversation();
+    if (activeConversation?.isActive) return;
+
+    // Create a dialogue line and show bubble
+    const line = {
+      characterId,
+      characterName: characterId,
+      message: cleanMessage,
+      timestamp: Date.now(),
+      emotion: emotion || "neutral",
+    };
+
+    this.speechBubbleManager.showBubble(line);
+  }
+
+  // Update speech bubbles for autonomous dialogue
+  private updateDialogueBubbles(): void {
+    if (!this.speechBubbleManager) return;
+
+    // Update bubble positions to follow characters
+    this.speechBubbleManager.update();
+
+    // Check for current dialogue line
+    const currentLine = getCurrentLine();
+
+    if (currentLine) {
+      // Skip raw JSON/code that leaks from AI responses
+      const msg = currentLine.message;
+      if (
+        msg.startsWith("{") ||
+        msg.startsWith("[") ||
+        msg.startsWith("<") ||
+        msg.includes('"type"') ||
+        msg.includes("```")
+      )
+        return;
+
+      // Create a unique ID for this line
+      const lineId = `${currentLine.characterId}-${currentLine.timestamp}-${msg.slice(0, 20)}`;
+
+      // Only show if it's a new line
+      if (lineId !== this.lastDialogueLine) {
+        this.lastDialogueLine = lineId;
+
+        // Update character sprites reference (in case they changed)
+        this.speechBubbleManager.setCharacterSprites(this.characterSprites);
+
+        // Truncate overly long messages
+        const sanitized = {
+          ...currentLine,
+          message: msg.length > 120 ? msg.slice(0, 117) + "..." : msg,
+        };
+
+        // Show the speech bubble
+        this.speechBubbleManager.showBubble(sanitized);
+      }
+    }
+  }
+
+  // Cleanup method to prevent memory leaks
+  // === AGENT SERVER WEBSOCKET ===
+
+  private connectToAgentServer(): void {
+    try {
+      // Allow configurable URL via window global or default to localhost:3001
+      const wsUrl =
+        (typeof window !== "undefined" && (window as any).__AGENTS_WS_URL) ||
+        "ws://localhost:3001/ws";
+
+      this.agentSocket = new WebSocket(wsUrl);
+
+      this.agentSocket.onopen = () => {
+        console.log("[WorldScene] Connected to agent server");
+        this.agentReconnectAttempts = 0;
+
+        // Start sending world state updates every 1 second
+        if (this.worldStateUpdateTimer) {
+          this.worldStateUpdateTimer.destroy();
+        }
+        this.worldStateUpdateTimer = this.time.addEvent({
+          delay: 1000,
+          callback: () => this.sendWorldStateUpdate(),
+          loop: true,
+        });
+      };
+
+      this.agentSocket.onmessage = (event: MessageEvent) => {
+        try {
+          const command = JSON.parse(event.data);
+          this.handleAgentCommand(command);
+        } catch (err) {
+          console.error("[WorldScene] Failed to parse agent message:", err);
+        }
+      };
+
+      this.agentSocket.onclose = () => {
+        console.log("[WorldScene] Agent server connection closed");
+        this.agentSocket = null;
+
+        // Stop the world state update timer when disconnected
+        if (this.worldStateUpdateTimer) {
+          this.worldStateUpdateTimer.destroy();
+          this.worldStateUpdateTimer = null;
+        }
+
+        this.scheduleAgentReconnect();
+      };
+
+      this.agentSocket.onerror = (err: Event) => {
+        // Log at debug level - agent server is optional
+        console.debug("[WorldScene] Agent server connection error:", err);
+      };
+    } catch (err) {
+      // Game works fine without the agent server
+      console.debug("[WorldScene] Could not connect to agent server:", err);
+      this.scheduleAgentReconnect();
+    }
+  }
+
+  private sendWorldStateUpdate(): void {
+    if (!this.agentSocket || this.agentSocket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    try {
+      // Build character states from current sprites
+      const characters: Record<string, { x: number; y: number; isMoving: boolean }> = {};
+
+      for (const [, sprite] of this.characterSprites) {
+        const spriteData = sprite as any;
+        let agentId: string | null = null;
+
+        // Map sprite flags to agent IDs (same pattern as findCharacterSprite)
+        if (spriteData.isFinn) agentId = "finn";
+        else if (spriteData.isDev) agentId = "ghost";
+        else if (spriteData.isScout) agentId = "neo";
+        else if (spriteData.isAsh) agentId = "ash";
+        else if (spriteData.isToly) agentId = "toly";
+        else if (spriteData.isCJ) agentId = "cj";
+        else if (spriteData.isShaw) agentId = "shaw";
+        else if (spriteData.isRamo) agentId = "ramo";
+        else if (spriteData.isSincara) agentId = "sincara";
+        else if (spriteData.isStuu) agentId = "stuu";
+        else if (spriteData.isSam) agentId = "sam";
+        else if (spriteData.isAlaa) agentId = "alaa";
+        else if (spriteData.isCarlo) agentId = "carlo";
+        else if (spriteData.isBNN) agentId = "bnn";
+        else if (spriteData.isProfessorOak) agentId = "professorOak";
+        else if (spriteData.isCityBot) agentId = "citybot";
+
+        if (agentId) {
+          characters[agentId] = {
+            x: sprite.x,
+            y: sprite.y,
+            isMoving: this.characterTargets.has(agentId),
+          };
+        }
+      }
+
+      const update = {
+        type: "world-state-update",
+        timestamp: Date.now(),
+        zone: this.currentZone,
+        characters,
+        weather: this.worldState?.weather || "cloudy",
+        health: this.worldState?.health || 50,
+      };
+
+      this.agentSocket.send(JSON.stringify(update));
+    } catch (err) {
+      console.error("[WorldScene] Failed to send world state update:", err);
+    }
+  }
+
+  private handleAgentCommand(command: any): void {
+    if (!command || !command.type) return;
+
+    try {
+      switch (command.type) {
+        case "character-behavior":
+          window.dispatchEvent(
+            new CustomEvent("agencity-character-behavior", {
+              detail: command,
+            })
+          );
+          break;
+
+        case "character-speak":
+          window.dispatchEvent(
+            new CustomEvent("agencity-character-speak", {
+              detail: {
+                characterId: command.characterId,
+                message: command.message,
+                emotion: command.emotion,
+              },
+            })
+          );
+          break;
+
+        case "zone-transition":
+          // Agent requested a zone change
+          if (command.target?.id) {
+            window.dispatchEvent(
+              new CustomEvent("agencity-zone-change", {
+                detail: { zone: command.target.id },
+              })
+            );
+          }
+          break;
+
+        case "pong":
+          // Heartbeat response, no action needed
+          break;
+
+        default:
+          console.debug("[WorldScene] Unknown agent command type:", command.type);
+      }
+    } catch (err) {
+      console.error("[WorldScene] Error handling agent command:", err);
+    }
+  }
+
+  private scheduleAgentReconnect(): void {
+    if (this.agentReconnectAttempts >= this.maxAgentReconnectAttempts) {
+      console.debug("[WorldScene] Max agent reconnect attempts reached, giving up");
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, this.agentReconnectAttempts), 30000);
+    this.agentReconnectAttempts++;
+
+    console.debug(
+      `[WorldScene] Scheduling agent reconnect in ${delay}ms (attempt ${this.agentReconnectAttempts}/${this.maxAgentReconnectAttempts})`
+    );
+
+    this.agentReconnectTimeout = setTimeout(() => {
+      this.agentReconnectTimeout = null;
+      this.connectToAgentServer();
+    }, delay);
+  }
+
+  registerZonePopupBuilding(
+    id: string,
+    sprite: Phaser.GameObjects.Sprite,
+    data: GameBuilding,
+    zone: ZoneType,
+    onInteract: () => void
+  ): void {
+    this.zonePopupBuildings.set(id, { sprite, data, zone, onInteract });
+  }
+
+  unregisterZonePopupBuilding(id: string): void {
+    this.zonePopupBuildings.delete(id);
+  }
+
+  unregisterZonePopupBuildingsByZone(zone: ZoneType): void {
+    for (const [id, entry] of this.zonePopupBuildings) {
+      if (entry.zone === zone) {
+        this.zonePopupBuildings.delete(id);
+      }
+    }
+  }
+
+  private cleanup(): void {
+    // Clean up tutorial
+    this.clearTutorialArrows();
+
+    // Remove window event listeners
+    if (this.boundToggleMusic) {
+      window.removeEventListener("agencity-toggle-music", this.boundToggleMusic);
+      this.boundToggleMusic = null;
+    }
+    if (this.boundSkipTrack) {
+      window.removeEventListener("agencity-skip-track", this.boundSkipTrack);
+      this.boundSkipTrack = null;
+    }
+    if (this.boundPrevTrack) {
+      window.removeEventListener("agencity-prev-track", this.boundPrevTrack);
+      this.boundPrevTrack = null;
+    }
+    if (this.boundBotEffect) {
+      window.removeEventListener("agencity-bot-effect", this.boundBotEffect);
+      this.boundBotEffect = null;
+    }
+    if (this.boundBotAnimal) {
+      window.removeEventListener("agencity-bot-animal", this.boundBotAnimal);
+      this.boundBotAnimal = null;
+    }
+    if (this.boundBotPokemon) {
+      window.removeEventListener("agencity-bot-pokemon", this.boundBotPokemon);
+      this.boundBotPokemon = null;
+    }
+    if (this.boundZoneChange) {
+      window.removeEventListener("agencity-zone-change", this.boundZoneChange);
+      this.boundZoneChange = null;
+    }
+    if (this.boundEnterWorld) {
+      window.removeEventListener("agencity-enter-world", this.boundEnterWorld);
+      this.boundEnterWorld = null;
+    }
+    if (this.boundExitWorld) {
+      window.removeEventListener("agencity-exit-world", this.boundExitWorld);
+      this.boundExitWorld = null;
+    }
+    if (this.boundEKeyDown) {
+      window.removeEventListener("keydown", this.boundEKeyDown);
+      this.boundEKeyDown = null;
+    }
+
+    // Clean up local player, drop shadow, and meme textures
+    if (this.localPlayer) {
+      const nameLabel = (this.localPlayer as any).nameLabel as Phaser.GameObjects.Text | undefined;
+      if (nameLabel) nameLabel.destroy();
+      const playerShadow = (this.localPlayer as any)._shadow as
+        | Phaser.GameObjects.Sprite
+        | undefined;
+      if (playerShadow) playerShadow.destroy();
+      this.localPlayer.destroy();
+      this.localPlayer = null;
+    }
+
+    // Clean up any remaining NPC drop shadows (sprites destroy themselves
+    // via scene shutdown, but shadows are separate game objects)
+    this.characterSprites.forEach((sprite) => {
+      const shadow = (sprite as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+      if (shadow) {
+        shadow.destroy();
+        (sprite as any)._shadow = null;
+      }
+    });
+
+    // Clean up persistent tap-to-move marker
+    if (this.tapMarker) {
+      this.tweens.killTweensOf(this.tapMarker);
+      this.tapMarker.destroy();
+      this.tapMarker = null;
+    }
+    for (const key of this.localPlayerTextureKeys) {
+      if (this.textures.exists(key)) {
+        this.textures.remove(key);
+      }
+    }
+    this.localPlayerTextureKeys = [];
+    this.pendingEnterWorld = null;
+    if (this.interactPrompt) {
+      this.interactPrompt.destroy();
+      this.interactPrompt = null;
+    }
+
+    // Stop music and clean up audio context
+    if (this.musicInterval) {
+      clearTimeout(this.musicInterval);
+      this.musicInterval = null;
+    }
+    if (this.audioContext) {
+      this.stopAllOscillators();
+      if (this.gainNode) {
+        this.gainNode.disconnect();
+        this.gainNode = null;
+      }
+      this.audioContext.close();
+      this.audioContext = null;
+    }
+
+    // Clean up zone-specific timers
+    if (this.tickerTimer) {
+      this.tickerTimer.destroy();
+      this.tickerTimer = null;
+    }
+    if (this.billboardTimer) {
+      this.billboardTimer.destroy();
+      this.billboardTimer = null;
+    }
+    clearTrafficTimers(this);
+
+    // Clean up speech bubble manager
+    if (this.speechBubbleManager) {
+      this.speechBubbleManager.destroy();
+      this.speechBubbleManager = null;
+    }
+
+    // Clean up encounter listener
+    if (this.boundEncounterEnd) {
+      window.removeEventListener("agencity-encounter-end", this.boundEncounterEnd);
+      this.boundEncounterEnd = null;
+    }
+
+    // Clean up behavior handlers
+    if (this.boundBehaviorHandler) {
+      window.removeEventListener("agencity-character-behavior", this.boundBehaviorHandler);
+      this.boundBehaviorHandler = null;
+    }
+    if (this.boundSpeakHandler) {
+      window.removeEventListener("agencity-character-speak", this.boundSpeakHandler);
+      this.boundSpeakHandler = null;
+    }
+    this.characterTargets.clear();
+
+    // Clean up agent server WebSocket
+    if (this.worldStateUpdateTimer) {
+      this.worldStateUpdateTimer.destroy();
+      this.worldStateUpdateTimer = null;
+    }
+    if (this.agentReconnectTimeout) {
+      clearTimeout(this.agentReconnectTimeout);
+      this.agentReconnectTimeout = null;
+    }
+    if (this.agentSocket) {
+      this.agentSocket.onclose = null; // Prevent reconnect on intentional close
+      this.agentSocket.close();
+      this.agentSocket = null;
+    }
+
+    // Clean up beach crabs and ambient creatures
+    this.beachCrabs = [];
+    this.ambientCreatures = [];
+  }
+
+  private createGround(): void {
+    // Main grass layer - positioned to fill bottom portion of screen
+    const groundY = Math.round(540 * SCALE); // Moved down slightly
+    const groundHeight = Math.round(180 * SCALE); // Taller to ensure full coverage
+    this.ground = this.add.tileSprite(GAME_WIDTH / 2, groundY, GAME_WIDTH, groundHeight, "grass");
+    this.ground.setDepth(0);
+
+    // Add path in the middle
+    const pathY = Math.round(570 * SCALE);
+    this.groundPath = this.add.tileSprite(
+      GAME_WIDTH / 2,
+      pathY,
+      GAME_WIDTH,
+      Math.round(40 * SCALE),
+      "path"
+    );
+    this.groundPath.setDepth(1);
+
+    // Sky-to-grass transition gradient (updated by time state)
+    this.groundTransition = this.add.graphics();
+    this.groundTransition.setDepth(-0.5);
+    this.drawGroundTransition("night");
+  }
+
+  private createSky(): void {
+    this.skyGradient = this.add.graphics();
+    this.skyGradient.setDepth(-2);
+
+    // Start with night sky (will be updated by timeInfo)
+    this.drawSkyGradient("night");
+
+    // Add distant city skyline silhouette
+    this.createDistantSkyline();
+
+    // Initialize skyline to night mode (matches drawSkyGradient("night") above)
+    this.updateSkylineForTime("night");
+
+    // Add pixel-correct stars (rectangles instead of circles)
+    this.stars = [];
+    const starCount = Math.round(50 * SCALE);
+    for (let i = 0; i < starCount; i++) {
+      const roll = Math.random();
+      // Pixel sizes: 1x1 (55%), 2x1 (17%), 1x2 (17%), 2x2 (11%)
+      let sw: number, sh: number;
+      if (roll < 0.55) {
+        sw = 1;
+        sh = 1;
+      } else if (roll < 0.72) {
+        sw = 2;
+        sh = 1;
+      } else if (roll < 0.89) {
+        sw = 1;
+        sh = 2;
+      } else {
+        sw = 2;
+        sh = 2;
+      }
+
+      // Color variation: 80% white, 12% warm, 8% cool
+      const colorRoll = Math.random();
+      let color = 0xffffff;
+      if (colorRoll > 0.92)
+        color = 0xddddff; // cool tint
+      else if (colorRoll > 0.8) color = 0xffeedd; // warm tint
+
+      const star = this.add.rectangle(
+        Math.random() * GAME_WIDTH,
+        Math.random() * Math.round(300 * SCALE),
+        Math.round(sw * SCALE),
+        Math.round(sh * SCALE),
+        color,
+        Math.random() * 0.5 + 0.3
+      );
+      star.setDepth(-1);
+      this.stars.push(star);
+
+      // Twinkle animation
+      this.tweens.add({
+        targets: star,
+        alpha: 0.1,
+        duration: 1000 + Math.random() * 2000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Add drifting sky clouds
+    this.createSkyClouds();
+
+    // Draw treeline horizon
+    this.drawTreeline();
+  }
+
+  private drawSkyGradient(timeState: "day" | "night" | "dusk" | "dawn"): void {
+    if (!this.skyGradient) return;
+    this.skyGradient.clear();
+    this.skyTimeState = timeState;
+
+    const skyH = Math.round(430 * SCALE);
+    const bandCount = 24;
+    const bandH = Math.ceil(skyH / bandCount);
+
+    // Color palettes per time state
+    const palettes: Record<string, { pos: number; color: number }[]> = {
+      day: [
+        { pos: 0.0, color: 0x1560bd }, // deep blue zenith
+        { pos: 0.2, color: 0x1e7ad8 },
+        { pos: 0.4, color: 0x1e90ff }, // dodger blue
+        { pos: 0.6, color: 0x5dade2 },
+        { pos: 0.8, color: 0x87ceeb }, // sky blue
+        { pos: 1.0, color: 0xb8dff0 }, // pale horizon
+      ],
+      night: [
+        { pos: 0.0, color: 0x050810 }, // deep black
+        { pos: 0.15, color: 0x080e20 },
+        { pos: 0.35, color: 0x0b1424 }, // dark navy
+        { pos: 0.55, color: 0x10182a },
+        { pos: 0.75, color: 0x141e30 }, // dark slate
+        { pos: 0.9, color: 0x182438 },
+        { pos: 1.0, color: 0x1c2a40 }, // muted horizon
+      ],
+      dusk: [
+        { pos: 0.0, color: 0x1a0a3e }, // deep purple
+        { pos: 0.15, color: 0x2d1066 },
+        { pos: 0.3, color: 0x5b2180 }, // violet
+        { pos: 0.45, color: 0x8b3a62 }, // magenta transition
+        { pos: 0.6, color: 0xc75030 }, // orange
+        { pos: 0.75, color: 0xe87840 },
+        { pos: 0.9, color: 0xf5a060 }, // peach
+        { pos: 1.0, color: 0xfcc89b }, // peach horizon
+      ],
+      dawn: [
+        { pos: 0.0, color: 0x0e1a3a }, // pre-dawn blue
+        { pos: 0.2, color: 0x1a2855 },
+        { pos: 0.35, color: 0x2a3a6a }, // transition blue
+        { pos: 0.5, color: 0x5a4a60 }, // purple-blue transition
+        { pos: 0.65, color: 0xb87030 }, // gold
+        { pos: 0.8, color: 0xe8a050 },
+        { pos: 0.9, color: 0xf5c080 }, // peach
+        { pos: 1.0, color: 0xfde0b0 }, // peach horizon
+      ],
+    };
+
+    const stops = palettes[timeState];
+
+    const lerpColor = (c1: number, c2: number, t: number): number => {
+      const r1 = (c1 >> 16) & 0xff,
+        g1 = (c1 >> 8) & 0xff,
+        b1 = c1 & 0xff;
+      const r2 = (c2 >> 16) & 0xff,
+        g2 = (c2 >> 8) & 0xff,
+        b2 = c2 & 0xff;
+      return (
+        (Math.round(r1 + (r2 - r1) * t) << 16) |
+        (Math.round(g1 + (g2 - g1) * t) << 8) |
+        Math.round(b1 + (b2 - b1) * t)
+      );
+    };
+
+    const getColor = (pos: number): number => {
+      for (let i = 0; i < stops.length - 1; i++) {
+        if (pos >= stops[i].pos && pos <= stops[i + 1].pos) {
+          const t = (pos - stops[i].pos) / (stops[i + 1].pos - stops[i].pos);
+          return lerpColor(stops[i].color, stops[i + 1].color, t);
+        }
+      }
+      return stops[stops.length - 1].color;
+    };
+
+    for (let i = 0; i < bandCount; i++) {
+      const pos = i / bandCount;
+      const color = getColor(pos);
+      this.skyGradient.fillStyle(color, 1);
+      this.skyGradient.fillRect(0, i * bandH, GAME_WIDTH, bandH + 1);
+
+      // Pixel-art dithering between bands
+      if (i > 1 && i < bandCount - 1) {
+        const nextColor = getColor((i + 1) / bandCount);
+        const ditherColor = lerpColor(color, nextColor, 0.5);
+        this.skyGradient.fillStyle(ditherColor, 0.25);
+        for (let dx = 0; dx < GAME_WIDTH; dx += 6) {
+          if ((dx + i) % 3 === 0) {
+            this.skyGradient.fillRect(dx, i * bandH + bandH - 2, 2, 2);
+          }
+        }
+      }
+    }
+  }
+
+  private updateSkyForTime(timeInfo: { isNight: boolean; isDusk: boolean; isDawn: boolean }): void {
+    // Don't update sky if we're in Ballers Valley (always golden hour there)
+    if (this.currentZone === "ballers") {
+      return;
+    }
+
+    // Map booleans to 4-state time
+    let timeState: "day" | "night" | "dusk" | "dawn";
+    if (timeInfo.isNight) timeState = "night";
+    else if (timeInfo.isDusk) timeState = "dusk";
+    else if (timeInfo.isDawn) timeState = "dawn";
+    else timeState = "day";
+
+    // Update sky gradient
+    this.drawSkyGradient(timeState);
+
+    // Graduated star alpha per time state — re-add twinkle after transition
+    const starAlphaMap: Record<string, number> = { night: 0.6, dusk: 0.35, dawn: 0.15, day: 0 };
+    const targetAlpha = starAlphaMap[timeState];
+    this.stars.forEach((star) => {
+      this.tweens.killTweensOf(star);
+      this.tweens.add({
+        targets: star,
+        alpha: targetAlpha,
+        duration: 2000,
+        ease: "Sine.easeInOut",
+        onComplete: () => {
+          if (targetAlpha > 0) {
+            // Restore twinkle animation (killed by the transition tween above)
+            this.tweens.add({
+              targets: star,
+              alpha: targetAlpha * 0.2,
+              duration: 1000 + Math.random() * 2000,
+              yoyo: true,
+              repeat: -1,
+              ease: "Sine.easeInOut",
+            });
+          }
+        },
+      });
+    });
+
+    // Update sky cloud tinting
+    const cloudTints: Record<string, { color: number; alpha: number }> = {
+      day: { color: 0xffffff, alpha: 0.15 },
+      dusk: { color: 0xffaa66, alpha: 0.18 },
+      dawn: { color: 0xffd700, alpha: 0.16 },
+      night: { color: 0xffffff, alpha: 0 },
+    };
+    const ct = cloudTints[timeState];
+    this.skyClouds.forEach((cloud) => {
+      cloud.setFillStyle(ct.color, ct.alpha);
+    });
+
+    // Update ground transition
+    this.drawGroundTransition(timeState);
+
+    // Update skyline brightness for time of day
+    this.updateSkylineForTime(timeState);
+  }
+
+  /**
+   * Adjust distant skyline elements based on time of day.
+   * During day/dawn: haze hidden, windows dimmed.
+   * During night/dusk: haze hidden, windows bright.
+   */
+  private updateSkylineForTime(timeState: "day" | "night" | "dusk" | "dawn"): void {
+    // Haze: only visible during day (creates atmospheric depth)
+    // Hidden at night/dusk/dawn to prevent warm glow bleeding through
+    const hazeAlpha: Record<string, number> = {
+      day: 1,
+      dawn: 0.4,
+      dusk: 0.2,
+      night: 0,
+    };
+    if (this.skylineHazeLayer) {
+      this.tweens.killTweensOf(this.skylineHazeLayer);
+      this.tweens.add({
+        targets: this.skylineHazeLayer,
+        alpha: hazeAlpha[timeState],
+        duration: 2000,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Window lights: brighter at night (building lights on), dimmer during day
+    const windowAlpha: Record<string, number> = {
+      day: 0.15,
+      dawn: 0.4,
+      dusk: 0.7,
+      night: 0.6,
+    };
+    if (this.skylineWindowsLayer) {
+      this.tweens.killTweensOf(this.skylineWindowsLayer);
+      this.tweens.add({
+        targets: this.skylineWindowsLayer,
+        alpha: windowAlpha[timeState],
+        duration: 2000,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Window glow: only visible at night/dusk
+    const glowAlpha: Record<string, number> = {
+      day: 0,
+      dawn: 0.2,
+      dusk: 0.6,
+      night: 0.5,
+    };
+    if (this.skylineGlowLayer) {
+      this.tweens.killTweensOf(this.skylineGlowLayer);
+      this.tweens.add({
+        targets: this.skylineGlowLayer,
+        alpha: glowAlpha[timeState],
+        duration: 2000,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Flicker rects: match window visibility
+    const flickerAlpha = windowAlpha[timeState];
+    this.skylineFlickerRects.forEach((rect) => {
+      this.tweens.killTweensOf(rect);
+      this.tweens.add({
+        targets: rect,
+        alpha: timeState === "day" ? 0 : flickerAlpha * (rect.alpha > 0 ? 1 : 0.5),
+        duration: 2000,
+        ease: "Sine.easeInOut",
+      });
+    });
+  }
+
+  private createSkyClouds(): void {
+    this.skyClouds = [];
+    const cloudData = [
+      { x: 120, y: 160, w: 200, h: 16 },
+      { x: 380, y: 200, w: 160, h: 12 },
+      { x: 600, y: 140, w: 220, h: 18 },
+      { x: 850, y: 190, w: 180, h: 14 },
+      { x: 1050, y: 170, w: 150, h: 10 },
+    ];
+
+    cloudData.forEach((cd) => {
+      const cloud = this.add.ellipse(cd.x, cd.y, cd.w, cd.h, 0xffffff, 0.12 + Math.random() * 0.08);
+      cloud.setDepth(-1.5);
+      this.skyClouds.push(cloud);
+
+      this.tweens.add({
+        targets: cloud,
+        x: cloud.x + 25 + Math.random() * 20,
+        duration: 15000 + Math.random() * 10000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+        delay: Math.random() * 5000,
+      });
+    });
+  }
+
+  private drawTreeline(): void {
+    if (!this.treeline) {
+      this.treeline = this.add.graphics();
+      this.treeline.setDepth(-0.3);
+    }
+    this.treeline.clear();
+
+    const baseY = Math.round(440 * SCALE);
+    const treeColors = [0x0a2a18, 0x0e3520];
+    let cx = 0;
+
+    while (cx < GAME_WIDTH) {
+      const w = Math.round((6 + Math.random() * 8) * SCALE);
+      const h = Math.round((8 + Math.random() * 10) * SCALE);
+      const color = treeColors[Math.floor(Math.random() * treeColors.length)];
+
+      // Draw triangular crown as stacked narrowing rectangles (pixel-art style)
+      this.treeline.fillStyle(color);
+      const layers = Math.max(3, Math.round(h / (2 * SCALE)));
+      for (let row = 0; row < layers; row++) {
+        const t = row / layers;
+        const rowW = Math.round(w * (1 - t * 0.7));
+        const rowX = cx + Math.round((w - rowW) / 2);
+        const rowY = baseY - h + Math.round(row * (h / layers));
+        this.treeline.fillRect(rowX, rowY, rowW, Math.ceil(h / layers) + 1);
+      }
+
+      // Short trunk
+      const trunkW = Math.round(2 * SCALE);
+      this.treeline.fillStyle(0x061a0e);
+      this.treeline.fillRect(
+        cx + Math.round((w - trunkW) / 2),
+        baseY,
+        trunkW,
+        Math.round(4 * SCALE)
+      );
+
+      cx += w + Math.round(Math.random() * 3 * SCALE);
+    }
+  }
+
+  private drawGroundTransition(timeState: "day" | "night" | "dusk" | "dawn"): void {
+    if (!this.groundTransition) return;
+    this.groundTransition.clear();
+
+    const topY = Math.round(430 * SCALE);
+    const bandH = Math.round(30 * SCALE);
+    const bands = 8;
+    const perBand = Math.ceil(bandH / bands);
+
+    // Sky-side color per time state (blends into grass green at bottom)
+    const skyColors: Record<string, number> = {
+      day: 0xb8dff0, // pale blue horizon
+      night: 0x1c2a40, // muted dark horizon (matches night palette bottom)
+      dusk: 0xfcc89b, // peach
+      dawn: 0xfde0b0, // warm peach
+    };
+    const grassColor = 0x1a472a; // matches grass base
+    const skyC = skyColors[timeState];
+
+    const lerpC = (c1: number, c2: number, t: number): number => {
+      const r1 = (c1 >> 16) & 0xff,
+        g1 = (c1 >> 8) & 0xff,
+        b1 = c1 & 0xff;
+      const r2 = (c2 >> 16) & 0xff,
+        g2 = (c2 >> 8) & 0xff,
+        b2 = c2 & 0xff;
+      return (
+        (Math.round(r1 + (r2 - r1) * t) << 16) |
+        (Math.round(g1 + (g2 - g1) * t) << 8) |
+        Math.round(b1 + (b2 - b1) * t)
+      );
+    };
+
+    for (let i = 0; i < bands; i++) {
+      const t = i / (bands - 1);
+      const color = lerpC(skyC, grassColor, t);
+      const alpha = 0.15 + t * 0.25; // fades in toward grass
+      this.groundTransition.fillStyle(color, alpha);
+      this.groundTransition.fillRect(0, topY + i * perBand, GAME_WIDTH, perBand + 1);
+    }
+  }
+
+  /**
+   * Draw the golden hour (sunset) sky for Ballers Valley
+   * Creates a warm orange-to-peach gradient that gives the VIP zone
+   * an exclusive, luxurious feel - always sunset, never changes
+   */
+  private drawBallersGoldenSky(): void {
+    // Create the golden sky graphics object if it doesn't exist
+    if (!this.ballersGoldenSky) {
+      this.ballersGoldenSky = this.add.graphics();
+      this.ballersGoldenSky.setDepth(-2); // Same depth as main sky
+      this.ballersElements.push(this.ballersGoldenSky);
+    }
+
+    this.ballersGoldenSky.clear();
+
+    // Golden hour sunset gradient - warm orange top to soft peach bottom
+    // Top colors (warm orange)
+    const topLeft = 0xf97316; // Tailwind orange-500
+    const topRight = 0xfb923c; // Tailwind orange-400
+    // Bottom colors (soft peach/gold)
+    const bottomLeft = 0xfed7aa; // Tailwind orange-200
+    const bottomRight = 0xfcd34d; // Tailwind amber-300
+
+    this.ballersGoldenSky.fillGradientStyle(
+      topLeft,
+      topRight,
+      bottomLeft,
+      bottomRight,
+      1 // Full opacity
+    );
+    this.ballersGoldenSky.fillRect(0, 0, GAME_WIDTH, Math.round(430 * SCALE));
+    this.ballersGoldenSky.setVisible(true);
+
+    // Hide the main sky gradient when showing golden sky
+    if (this.skyGradient) {
+      this.skyGradient.setVisible(false);
+    }
+
+    // Dim stars in golden hour (sunset still has some stars starting to show)
+    this.stars.forEach((star) => {
+      this.tweens.add({
+        targets: star,
+        alpha: 0.15, // Very faint stars
+        duration: 500,
+        ease: "Sine.easeInOut",
+      });
+    });
+  }
+
+  /**
+   * Restore the normal sky when leaving Ballers Valley
+   * Shows the main sky gradient and updates it based on current time
+   */
+  public restoreNormalSky(): void {
+    // Hide the golden sky
+    if (this.ballersGoldenSky) {
+      this.ballersGoldenSky.setVisible(false);
+    }
+
+    // Hide the academy twilight sky
+    if (this.academyTwilightSky) {
+      this.academyTwilightSky.setVisible(false);
+    }
+    if (this.academyMoon) {
+      this.academyMoon.setVisible(false);
+    }
+    this.academyStars.forEach((star) => star.setVisible(false));
+
+    // Hide the ascension celestial sky
+    if (this.ascensionCelestialSky) {
+      this.ascensionCelestialSky.setVisible(false);
+    }
+    this.ascensionSkyElements.forEach((el) => (el as any).setVisible(false));
+
+    // Show the main sky gradient
+    if (this.skyGradient) {
+      this.skyGradient.setVisible(true);
+    }
+
+    // Restore stars (may have been hidden by ascension zone)
+    this.stars.forEach((star) => star.setVisible(true));
+
+    // Restore distant skyline (may have been hidden by ascension zone)
+    this.distantSkylineGfx.forEach((g) => g.setVisible(true));
+
+    // Restore sky clouds
+    this.skyClouds.forEach((c) => c.setVisible(true));
+
+    // Restore treeline
+    if (this.treeline) this.treeline.setVisible(true);
+  }
+
+  /**
+   * Draw the magical twilight sky for Academy zone
+   * Creates a mystical purple-to-indigo gradient that gives the Academy
+   * a Hogwarts-like magical atmosphere - always twilight, with bright stars and moon
+   */
+  private drawAcademyTwilightSky(): void {
+    // Create the twilight sky graphics object if it doesn't exist
+    if (!this.academyTwilightSky) {
+      this.academyTwilightSky = this.add.graphics();
+      this.academyTwilightSky.setDepth(-2);
+      this.academyElements.push(this.academyTwilightSky);
+    }
+
+    this.academyTwilightSky.clear();
+
+    // Magical twilight gradient - deep purple top to mystical indigo bottom
+    // Top colors (deep space purple)
+    const topLeft = 0x1e1b4b; // Very dark indigo
+    const topRight = 0x312e81; // Deep indigo
+    // Bottom colors (twilight purple-blue)
+    const bottomLeft = 0x4c1d95; // Violet-purple
+    const bottomRight = 0x5b21b6; // Rich purple
+
+    this.academyTwilightSky.fillGradientStyle(topLeft, topRight, bottomLeft, bottomRight, 1);
+    this.academyTwilightSky.fillRect(0, 0, GAME_WIDTH, Math.round(430 * SCALE));
+    this.academyTwilightSky.setVisible(true);
+
+    // Hide the main sky gradient when showing twilight sky
+    if (this.skyGradient) {
+      this.skyGradient.setVisible(false);
+    }
+    if (this.ballersGoldenSky) {
+      this.ballersGoldenSky.setVisible(false);
+    }
+
+    // Create crescent moon if it doesn't exist
+    if (!this.academyMoon) {
+      const moonX = GAME_WIDTH - Math.round(120 * SCALE);
+      const moonY = Math.round(80 * SCALE);
+      const moonRadius = Math.round(35 * SCALE);
+
+      // Main moon glow (outer)
+      const moonGlow = this.add.circle(
+        moonX,
+        moonY,
+        moonRadius + Math.round(15 * SCALE),
+        0xfef3c7,
+        0.15
+      );
+      moonGlow.setDepth(-1.9);
+      this.academyElements.push(moonGlow);
+
+      // Moon body
+      this.academyMoon = this.add.circle(moonX, moonY, moonRadius, 0xfef9c3); // Pale yellow
+      this.academyMoon.setDepth(-1.8);
+      this.academyElements.push(this.academyMoon);
+
+      // Crescent shadow (to make it look like crescent moon)
+      const crescentShadow = this.add.circle(
+        moonX + Math.round(12 * SCALE),
+        moonY - Math.round(5 * SCALE),
+        moonRadius - Math.round(5 * SCALE),
+        0x1e1b4b // Same as sky top color
+      );
+      crescentShadow.setDepth(-1.7);
+      this.academyElements.push(crescentShadow);
+
+      // Subtle moon surface details
+      const crater1 = this.add.circle(
+        moonX - Math.round(8 * SCALE),
+        moonY + Math.round(5 * SCALE),
+        Math.round(4 * SCALE),
+        0xfde68a,
+        0.3
+      );
+      crater1.setDepth(-1.75);
+      this.academyElements.push(crater1);
+
+      const crater2 = this.add.circle(
+        moonX - Math.round(12 * SCALE),
+        moonY - Math.round(8 * SCALE),
+        Math.round(3 * SCALE),
+        0xfde68a,
+        0.25
+      );
+      crater2.setDepth(-1.75);
+      this.academyElements.push(crater2);
+
+      // Add gentle pulsing glow animation to moon
+      this.tweens.add({
+        targets: moonGlow,
+        alpha: 0.25,
+        duration: 3000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+    this.academyMoon.setVisible(true);
+
+    // Create extra bright stars for Academy if they don't exist
+    if (this.academyStars.length === 0) {
+      // Bright constellation stars
+      const starPositions = [
+        { x: 100, y: 50, size: 3, alpha: 0.9 },
+        { x: 180, y: 120, size: 2.5, alpha: 0.85 },
+        { x: 250, y: 70, size: 2, alpha: 0.8 },
+        { x: 320, y: 150, size: 2.5, alpha: 0.85 },
+        { x: 400, y: 60, size: 3, alpha: 0.9 },
+        { x: 480, y: 130, size: 2, alpha: 0.8 },
+        { x: 550, y: 80, size: 2.5, alpha: 0.85 },
+        { x: 620, y: 140, size: 2, alpha: 0.8 },
+        { x: 700, y: 55, size: 3, alpha: 0.9 },
+        { x: 760, y: 110, size: 2.5, alpha: 0.85 },
+        { x: 150, y: 180, size: 2, alpha: 0.75 },
+        { x: 350, y: 200, size: 2, alpha: 0.75 },
+        { x: 580, y: 190, size: 2, alpha: 0.75 },
+        { x: 220, y: 30, size: 2.5, alpha: 0.85 },
+        { x: 450, y: 25, size: 2, alpha: 0.8 },
+        { x: 680, y: 35, size: 2.5, alpha: 0.85 },
+      ];
+
+      starPositions.forEach((pos) => {
+        const star = this.add.circle(
+          Math.round(pos.x * SCALE),
+          Math.round(pos.y * SCALE),
+          Math.round(pos.size * SCALE),
+          0xffffff,
+          pos.alpha
+        );
+        star.setDepth(-1.5);
+        this.academyStars.push(star);
+        this.academyElements.push(star);
+
+        // Add twinkling animation with varying speeds
+        this.tweens.add({
+          targets: star,
+          alpha: pos.alpha * 0.4,
+          duration: 800 + Math.random() * 1500,
+          yoyo: true,
+          repeat: -1,
+          ease: "Sine.easeInOut",
+        });
+      });
+
+      // Add some smaller background stars
+      for (let i = 0; i < 40; i++) {
+        const star = this.add.circle(
+          Math.random() * GAME_WIDTH,
+          Math.random() * Math.round(250 * SCALE),
+          Math.round((0.8 + Math.random() * 1.2) * SCALE),
+          0xc4b5fd, // Soft purple-white stars
+          0.4 + Math.random() * 0.3
+        );
+        star.setDepth(-1.6);
+        this.academyStars.push(star);
+        this.academyElements.push(star);
+
+        this.tweens.add({
+          targets: star,
+          alpha: 0.2,
+          duration: 1000 + Math.random() * 2000,
+          yoyo: true,
+          repeat: -1,
+          ease: "Sine.easeInOut",
+        });
+      }
+    }
+
+    // Show all academy stars
+    this.academyStars.forEach((star) => star.setVisible(true));
+
+    // Dim main stars in twilight
+    this.stars.forEach((star) => {
+      this.tweens.add({
+        targets: star,
+        alpha: 0.1,
+        duration: 500,
+        ease: "Sine.easeInOut",
+      });
+    });
+  }
+
+  private createDistantSkyline(): void {
+    const groundLevel = Math.round(440 * SCALE);
+
+    // === LAYER 1: Atmospheric haze/glow at horizon ===
+    const hazeLayer = this.add.graphics();
+    hazeLayer.setDepth(-2.5);
+    this.distantSkylineGfx.push(hazeLayer);
+    this.skylineHazeLayer = hazeLayer;
+
+    // Gradient haze from horizon upward (gives depth)
+    // Starts hidden — updateSkylineForTime() sets correct alpha based on time
+    for (let i = 0; i < 8; i++) {
+      const alpha = 0.15 - i * 0.015;
+      const y = groundLevel - Math.round(i * 12 * SCALE);
+      hazeLayer.fillStyle(0x87ceeb, Math.max(0, alpha)); // Sky blue haze
+      hazeLayer.fillRect(0, y, GAME_WIDTH, Math.round(15 * SCALE));
+    }
+    hazeLayer.setAlpha(0); // Hidden until updateSkylineForTime is called
+
+    // === LAYER 2: Far distant buildings (very faded, smaller) ===
+    const farSkyline = this.add.graphics();
+    farSkyline.setDepth(-2);
+    this.distantSkylineGfx.push(farSkyline);
+    farSkyline.fillStyle(0x2d3748, 0.25); // Very faded
+
+    const drawFarBuilding = (x: number, topY: number, width: number) => {
+      farSkyline.fillRect(x, topY, width, groundLevel - topY);
+    };
+
+    // Scattered far buildings (smaller, behind main skyline)
+    drawFarBuilding(Math.round(30 * SCALE), Math.round(395 * SCALE), Math.round(12 * SCALE));
+    drawFarBuilding(Math.round(100 * SCALE), Math.round(385 * SCALE), Math.round(15 * SCALE));
+    drawFarBuilding(Math.round(180 * SCALE), Math.round(375 * SCALE), Math.round(14 * SCALE));
+    drawFarBuilding(Math.round(280 * SCALE), Math.round(365 * SCALE), Math.round(18 * SCALE));
+    drawFarBuilding(Math.round(380 * SCALE), Math.round(355 * SCALE), Math.round(20 * SCALE));
+    drawFarBuilding(Math.round(480 * SCALE), Math.round(370 * SCALE), Math.round(16 * SCALE));
+    drawFarBuilding(Math.round(580 * SCALE), Math.round(380 * SCALE), Math.round(14 * SCALE));
+    drawFarBuilding(Math.round(680 * SCALE), Math.round(375 * SCALE), Math.round(15 * SCALE));
+    drawFarBuilding(Math.round(760 * SCALE), Math.round(390 * SCALE), Math.round(12 * SCALE));
+
+    // === LAYER 3: Main skyline buildings (medium opacity) ===
+    const mainSkyline = this.add.graphics();
+    mainSkyline.setDepth(-1.8);
+    this.distantSkylineGfx.push(mainSkyline);
+
+    const drawBuilding = (
+      g: Phaser.GameObjects.Graphics,
+      x: number,
+      topY: number,
+      width: number,
+      color: number,
+      alpha: number
+    ) => {
+      g.fillStyle(color, alpha);
+      g.fillRect(x, topY, width, groundLevel - topY);
+    };
+
+    // Left cluster
+    drawBuilding(
+      mainSkyline,
+      Math.round(15 * SCALE),
+      Math.round(380 * SCALE),
+      Math.round(18 * SCALE),
+      0x1e293b,
+      0.45
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(38 * SCALE),
+      Math.round(360 * SCALE),
+      Math.round(22 * SCALE),
+      0x1a2535,
+      0.5
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(65 * SCALE),
+      Math.round(375 * SCALE),
+      Math.round(16 * SCALE),
+      0x1e293b,
+      0.45
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(88 * SCALE),
+      Math.round(355 * SCALE),
+      Math.round(20 * SCALE),
+      0x1a2535,
+      0.5
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(115 * SCALE),
+      Math.round(370 * SCALE),
+      Math.round(18 * SCALE),
+      0x1e293b,
+      0.45
+    );
+
+    // Center-left cluster
+    drawBuilding(
+      mainSkyline,
+      Math.round(165 * SCALE),
+      Math.round(350 * SCALE),
+      Math.round(20 * SCALE),
+      0x1a2535,
+      0.5
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(192 * SCALE),
+      Math.round(330 * SCALE),
+      Math.round(28 * SCALE),
+      0x0f172a,
+      0.55
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(228 * SCALE),
+      Math.round(355 * SCALE),
+      Math.round(18 * SCALE),
+      0x1e293b,
+      0.45
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(253 * SCALE),
+      Math.round(340 * SCALE),
+      Math.round(24 * SCALE),
+      0x1a2535,
+      0.5
+    );
+
+    // Center cluster (tallest - most prominent)
+    drawBuilding(
+      mainSkyline,
+      Math.round(320 * SCALE),
+      Math.round(310 * SCALE),
+      Math.round(26 * SCALE),
+      0x0f172a,
+      0.6
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(355 * SCALE),
+      Math.round(280 * SCALE),
+      Math.round(35 * SCALE),
+      0x0f172a,
+      0.65
+    ); // Tallest
+    drawBuilding(
+      mainSkyline,
+      Math.round(400 * SCALE),
+      Math.round(295 * SCALE),
+      Math.round(30 * SCALE),
+      0x0f172a,
+      0.6
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(440 * SCALE),
+      Math.round(320 * SCALE),
+      Math.round(22 * SCALE),
+      0x1a2535,
+      0.55
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(470 * SCALE),
+      Math.round(345 * SCALE),
+      Math.round(18 * SCALE),
+      0x1e293b,
+      0.5
+    );
+
+    // Center-right cluster
+    drawBuilding(
+      mainSkyline,
+      Math.round(525 * SCALE),
+      Math.round(355 * SCALE),
+      Math.round(20 * SCALE),
+      0x1e293b,
+      0.45
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(555 * SCALE),
+      Math.round(335 * SCALE),
+      Math.round(26 * SCALE),
+      0x1a2535,
+      0.5
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(590 * SCALE),
+      Math.round(360 * SCALE),
+      Math.round(18 * SCALE),
+      0x1e293b,
+      0.45
+    );
+
+    // Right cluster
+    drawBuilding(
+      mainSkyline,
+      Math.round(645 * SCALE),
+      Math.round(350 * SCALE),
+      Math.round(20 * SCALE),
+      0x1a2535,
+      0.5
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(675 * SCALE),
+      Math.round(330 * SCALE),
+      Math.round(28 * SCALE),
+      0x0f172a,
+      0.55
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(712 * SCALE),
+      Math.round(355 * SCALE),
+      Math.round(22 * SCALE),
+      0x1e293b,
+      0.45
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(742 * SCALE),
+      Math.round(340 * SCALE),
+      Math.round(24 * SCALE),
+      0x1a2535,
+      0.5
+    );
+    drawBuilding(
+      mainSkyline,
+      Math.round(775 * SCALE),
+      Math.round(365 * SCALE),
+      Math.round(20 * SCALE),
+      0x1e293b,
+      0.45
+    );
+
+    // === LAYER 4: Building details (spires, antennas, rooftop features) ===
+    const detailsLayer = this.add.graphics();
+    detailsLayer.setDepth(-1.7);
+    this.distantSkylineGfx.push(detailsLayer);
+    detailsLayer.fillStyle(0x0f172a, 0.6);
+
+    // Spire on tallest building
+    detailsLayer.fillRect(
+      Math.round(370 * SCALE),
+      Math.round(260 * SCALE),
+      Math.round(5 * SCALE),
+      Math.round(20 * SCALE)
+    );
+    // Antenna details
+    detailsLayer.fillRect(
+      Math.round(205 * SCALE),
+      Math.round(318 * SCALE),
+      Math.round(2 * SCALE),
+      Math.round(12 * SCALE)
+    );
+    detailsLayer.fillRect(
+      Math.round(412 * SCALE),
+      Math.round(283 * SCALE),
+      Math.round(2 * SCALE),
+      Math.round(12 * SCALE)
+    );
+    detailsLayer.fillRect(
+      Math.round(688 * SCALE),
+      Math.round(318 * SCALE),
+      Math.round(2 * SCALE),
+      Math.round(12 * SCALE)
+    );
+    // Rooftop boxes (AC units, etc.)
+    detailsLayer.fillRect(
+      Math.round(360 * SCALE),
+      Math.round(278 * SCALE),
+      Math.round(8 * SCALE),
+      Math.round(4 * SCALE)
+    );
+    detailsLayer.fillRect(
+      Math.round(378 * SCALE),
+      Math.round(278 * SCALE),
+      Math.round(6 * SCALE),
+      Math.round(4 * SCALE)
+    );
+
+    // === LAYER 5: Window lights (varied brightness, more of them) ===
+    const windowsLayer = this.add.graphics();
+    windowsLayer.setDepth(-1.6);
+    this.distantSkylineGfx.push(windowsLayer);
+    this.skylineWindowsLayer = windowsLayer;
+
+    // Window definitions: x, y, brightness (0.15-0.4)
+    const windows = [
+      // Tall center building - lots of windows
+      { x: 362, y: 290, b: 0.35 },
+      { x: 370, y: 290, b: 0.25 },
+      { x: 378, y: 290, b: 0.3 },
+      { x: 362, y: 310, b: 0.2 },
+      { x: 370, y: 310, b: 0.4 },
+      { x: 378, y: 310, b: 0.15 },
+      { x: 362, y: 330, b: 0.3 },
+      { x: 370, y: 330, b: 0.2 },
+      { x: 378, y: 330, b: 0.35 },
+      { x: 362, y: 350, b: 0.25 },
+      { x: 370, y: 350, b: 0.3 },
+      { x: 378, y: 350, b: 0.2 },
+      { x: 362, y: 370, b: 0.15 },
+      { x: 370, y: 370, b: 0.25 },
+      { x: 378, y: 370, b: 0.4 },
+      { x: 362, y: 390, b: 0.3 },
+      { x: 370, y: 390, b: 0.2 },
+      // Second tall building
+      { x: 405, y: 305, b: 0.25 },
+      { x: 415, y: 305, b: 0.35 },
+      { x: 405, y: 325, b: 0.4 },
+      { x: 415, y: 325, b: 0.2 },
+      { x: 405, y: 345, b: 0.15 },
+      { x: 415, y: 345, b: 0.3 },
+      { x: 405, y: 365, b: 0.25 },
+      // Left buildings
+      { x: 45, y: 370, b: 0.2 },
+      { x: 45, y: 390, b: 0.3 },
+      { x: 95, y: 365, b: 0.35 },
+      { x: 95, y: 385, b: 0.2 },
+      { x: 198, y: 340, b: 0.3 },
+      { x: 206, y: 340, b: 0.2 },
+      { x: 198, y: 360, b: 0.25 },
+      { x: 206, y: 360, b: 0.4 },
+      { x: 198, y: 380, b: 0.15 },
+      // Right buildings
+      { x: 560, y: 345, b: 0.3 },
+      { x: 568, y: 345, b: 0.2 },
+      { x: 560, y: 365, b: 0.25 },
+      { x: 568, y: 365, b: 0.35 },
+      { x: 682, y: 340, b: 0.4 },
+      { x: 690, y: 340, b: 0.2 },
+      { x: 682, y: 360, b: 0.15 },
+      { x: 690, y: 360, b: 0.3 },
+      { x: 682, y: 380, b: 0.25 },
+      { x: 690, y: 380, b: 0.35 },
+      { x: 750, y: 350, b: 0.3 },
+      { x: 750, y: 370, b: 0.2 },
+    ];
+
+    windows.forEach((w) => {
+      windowsLayer.fillStyle(0xffeaa7, w.b); // Warm yellow light
+      windowsLayer.fillRect(
+        Math.round(w.x * SCALE),
+        Math.round(w.y * SCALE),
+        Math.round(4 * SCALE),
+        Math.round(5 * SCALE)
+      );
+    });
+
+    // === LAYER 6: Subtle glow beneath some windows ===
+    const glowLayer = this.add.graphics();
+    glowLayer.setDepth(-1.65);
+    this.distantSkylineGfx.push(glowLayer);
+    this.skylineGlowLayer = glowLayer;
+
+    // Add small glow spots beneath brightest windows
+    const brightWindows = windows.filter((w) => w.b >= 0.35);
+    brightWindows.forEach((w) => {
+      glowLayer.fillStyle(0xffeaa7, 0.08);
+      glowLayer.fillCircle(
+        Math.round((w.x + 2) * SCALE),
+        Math.round((w.y + 8) * SCALE),
+        Math.round(6 * SCALE)
+      );
+    });
+
+    // === LAYER 7: Animated window flicker overlays ===
+    const flickerWindows = brightWindows.slice(0, 10);
+    const flickerRects: Phaser.GameObjects.Rectangle[] = [];
+    flickerWindows.forEach((w) => {
+      const rect = this.add.rectangle(
+        Math.round((w.x + 2) * SCALE),
+        Math.round((w.y + 2.5) * SCALE),
+        Math.round(4 * SCALE),
+        Math.round(5 * SCALE),
+        0xffeaa7,
+        w.b
+      );
+      rect.setDepth(-1.55);
+      flickerRects.push(rect);
+      this.distantSkylineGfx.push(rect);
+    });
+    this.skylineFlickerRects = flickerRects;
+
+    // Timer: every 3.5s randomly flicker 2-3 windows
+    this.time.addEvent({
+      delay: 3500,
+      loop: true,
+      callback: () => {
+        const count = 2 + Math.floor(Math.random() * 2); // 2-3 windows
+        for (let i = 0; i < count; i++) {
+          const idx = Math.floor(Math.random() * flickerRects.length);
+          const rect = flickerRects[idx];
+          if (!rect || !(rect as Phaser.GameObjects.Rectangle).active) continue;
+          const baseAlpha = flickerWindows[idx].b;
+          this.tweens.add({
+            targets: rect,
+            alpha: baseAlpha * (0.3 + Math.random() * 0.9),
+            duration: 400 + Math.random() * 600,
+            yoyo: true,
+            ease: "Sine.easeInOut",
+          });
+        }
+      },
+    });
+  }
+
+  private createDecorations(): void {
+    // Ground reference for positioning (top of grass area)
+    const grassTop = Y.GRASS_TOP;
+    const pathLevel = Y.PATH_LEVEL;
+
+    // Add trees (positioned at grass top level)
+    const treePositions = [
+      { x: Math.round(50 * SCALE), y: grassTop },
+      { x: Math.round(750 * SCALE), y: grassTop - Math.round(5 * SCALE) },
+      { x: Math.round(180 * SCALE), y: grassTop + Math.round(10 * SCALE) },
+      { x: Math.round(620 * SCALE), y: grassTop + Math.round(5 * SCALE) },
+    ];
+
+    treePositions.forEach((pos, i) => {
+      const tree = this.add.sprite(pos.x, pos.y, "tree");
+      tree.setOrigin(0.5, 1);
+      tree.setDepth(2);
+      tree.setScale((0.9 + Math.random() * 0.3) * SCALE);
+      this.decorations.push(tree);
+
+      // Gentle sway animation
+      this.tweens.add({
+        targets: tree,
+        angle: 2,
+        duration: 2000 + i * 500,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    });
+
+    // Add bushes (positioned on grass)
+    const bushPositions = [
+      { x: Math.round(100 * SCALE), y: grassTop + Math.round(25 * SCALE) },
+      { x: Math.round(300 * SCALE), y: grassTop + Math.round(20 * SCALE) },
+      { x: Math.round(500 * SCALE), y: grassTop + Math.round(23 * SCALE) },
+      { x: Math.round(700 * SCALE), y: grassTop + Math.round(21 * SCALE) },
+    ];
+
+    bushPositions.forEach((pos) => {
+      const bush = this.add.sprite(pos.x, pos.y, "bush");
+      bush.setOrigin(0.5, 1);
+      bush.setDepth(2);
+      bush.setScale((0.7 + Math.random() * 0.3) * SCALE);
+      this.decorations.push(bush);
+    });
+
+    // Add lamp posts (positioned near path)
+    const lampPositions = [
+      { x: Math.round(200 * SCALE), y: pathLevel },
+      { x: Math.round(600 * SCALE), y: pathLevel },
+    ];
+
+    lampPositions.forEach((pos) => {
+      const lamp = this.add.sprite(pos.x, pos.y, "lamp");
+      lamp.setOrigin(0.5, 1);
+      lamp.setDepth(3);
+      this.decorations.push(lamp);
+
+      // Add light glow (scaled)
+      const glow = this.add.sprite(pos.x, pos.y - Math.round(30 * SCALE), "glow");
+      glow.setAlpha(0.3);
+      glow.setScale(0.8 * SCALE);
+      glow.setDepth(2);
+      glow.setTint(0xfbbf24);
+
+      this.tweens.add({
+        targets: glow,
+        alpha: 0.5,
+        scale: 0.9 * SCALE,
+        duration: 1500,
+        yoyo: true,
+        repeat: -1,
+      });
+    });
+
+    // Add benches (positioned near path)
+    const benchPositions = [
+      { x: Math.round(350 * SCALE), y: pathLevel - Math.round(5 * SCALE) },
+      { x: Math.round(450 * SCALE), y: pathLevel - Math.round(5 * SCALE) },
+    ];
+
+    benchPositions.forEach((pos) => {
+      const bench = this.add.sprite(pos.x, pos.y, "bench");
+      bench.setOrigin(0.5, 1);
+      bench.setDepth(3);
+      this.decorations.push(bench);
+    });
+  }
+
+  private createClouds(): void {
+    for (let i = 0; i < 6; i++) {
+      const cloud = this.add.sprite(
+        Math.random() * GAME_WIDTH * 1.1 - Math.round(50 * SCALE),
+        Math.round(30 * SCALE) + Math.random() * Math.round(120 * SCALE),
+        "cloud"
+      );
+      cloud.setAlpha(0.5 + Math.random() * 0.3);
+      cloud.setScale((0.6 + Math.random() * 0.5) * SCALE);
+      cloud.setDepth(1);
+      this.clouds.push(cloud);
+    }
+  }
+
+  private createAnimals(): void {
+    const animalTypes: Animal["type"][] = ["dog", "cat", "bird", "butterfly", "squirrel"];
+
+    // Reference positions
+    const pathLevel = Y.PATH_LEVEL;
+    const grassTop = Y.GRASS_TOP;
+
+    // Create a variety of animals (positioned relative to ground)
+    const animalConfigs = [
+      {
+        type: "dog" as const,
+        x: Math.round(150 * SCALE),
+        y: pathLevel + Math.round(10 * SCALE),
+        scale: 1.2 * SCALE,
+      },
+      {
+        type: "cat" as const,
+        x: Math.round(650 * SCALE),
+        y: pathLevel + Math.round(10 * SCALE),
+        scale: 1.1 * SCALE,
+      },
+      {
+        type: "bird" as const,
+        x: Math.round(100 * SCALE),
+        y: grassTop - Math.round(20 * SCALE),
+        scale: 0.8 * SCALE,
+      },
+      {
+        type: "bird" as const,
+        x: Math.round(700 * SCALE),
+        y: grassTop - Math.round(10 * SCALE),
+        scale: 0.7 * SCALE,
+      },
+      {
+        type: "butterfly" as const,
+        x: Math.round(300 * SCALE),
+        y: grassTop - Math.round(30 * SCALE),
+        scale: 0.6 * SCALE,
+      },
+      {
+        type: "butterfly" as const,
+        x: Math.round(500 * SCALE),
+        y: grassTop - Math.round(40 * SCALE),
+        scale: 0.5 * SCALE,
+      },
+      {
+        type: "squirrel" as const,
+        x: Math.round(80 * SCALE),
+        y: grassTop + Math.round(20 * SCALE),
+        scale: 1.0 * SCALE,
+      },
+    ];
+
+    animalConfigs.forEach((config) => {
+      const sprite = this.add.sprite(config.x, config.y, config.type);
+      sprite.setScale(config.scale);
+      sprite.setDepth(4);
+
+      // Flying animals have higher depth
+      if (config.type === "bird" || config.type === "butterfly") {
+        sprite.setDepth(15);
+      }
+
+      const animal: Animal = {
+        sprite,
+        type: config.type,
+        targetX: config.x + (Math.random() * Math.round(200 * SCALE) - Math.round(100 * SCALE)),
+        speed:
+          config.type === "butterfly"
+            ? 0.3 * SCALE
+            : config.type === "bird"
+              ? 0.5 * SCALE
+              : 0.2 * SCALE,
+        direction: Math.random() > 0.5 ? "left" : "right",
+        idleTimer: 0,
+        isIdle: Math.random() > 0.5,
+      };
+
+      this.animals.push(animal);
+
+      // Add idle animation for ground animals (scaled movement)
+      if (config.type !== "bird" && config.type !== "butterfly") {
+        this.tweens.add({
+          targets: sprite,
+          y: config.y - Math.round(2 * SCALE),
+          duration: 500 + Math.random() * 300,
+          yoyo: true,
+          repeat: -1,
+          ease: "Sine.easeInOut",
+        });
+      }
+
+      // Flying animation for birds and butterflies (scaled movement)
+      if (config.type === "bird") {
+        this.tweens.add({
+          targets: sprite,
+          y: config.y - Math.round(15 * SCALE),
+          duration: 800 + Math.random() * 400,
+          yoyo: true,
+          repeat: -1,
+          ease: "Sine.easeInOut",
+        });
+      }
+
+      if (config.type === "butterfly") {
+        this.tweens.add({
+          targets: sprite,
+          y: config.y - Math.round(20 * SCALE),
+          angle: 5,
+          duration: 600 + Math.random() * 300,
+          yoyo: true,
+          repeat: -1,
+          ease: "Sine.easeInOut",
+        });
+      }
+    });
+  }
+
+  private createExtraDecorations(): void {
+    // Reference positions
+    const grassTop = Y.GRASS_TOP;
+    const pathLevel = Y.PATH_LEVEL;
+
+    // Add flower patches (positioned on grass)
+    const flowerPositions = [
+      { x: Math.round(130 * SCALE), y: grassTop + Math.round(35 * SCALE) },
+      { x: Math.round(280 * SCALE), y: grassTop + Math.round(30 * SCALE) },
+      { x: Math.round(420 * SCALE), y: grassTop + Math.round(33 * SCALE) },
+      { x: Math.round(560 * SCALE), y: grassTop + Math.round(27 * SCALE) },
+      { x: Math.round(680 * SCALE), y: grassTop + Math.round(31 * SCALE) },
+    ];
+
+    flowerPositions.forEach((pos) => {
+      const flower = this.add.sprite(pos.x, pos.y, "flower");
+      flower.setOrigin(0.5, 1);
+      flower.setDepth(2);
+      flower.setScale((0.8 + Math.random() * 0.4) * SCALE);
+      this.decorations.push(flower);
+
+      // Gentle sway
+      this.tweens.add({
+        targets: flower,
+        angle: 3,
+        duration: 1500 + Math.random() * 500,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    });
+
+    // Add rocks (positioned near path)
+    const rockPositions = [
+      { x: Math.round(70 * SCALE), y: pathLevel + Math.round(5 * SCALE) },
+      { x: Math.round(730 * SCALE), y: pathLevel + Math.round(2 * SCALE) },
+      { x: Math.round(380 * SCALE), y: pathLevel + Math.round(8 * SCALE) },
+    ];
+
+    rockPositions.forEach((pos) => {
+      const rock = this.add.sprite(pos.x, pos.y, "rock");
+      rock.setOrigin(0.5, 1);
+      rock.setDepth(2);
+      rock.setScale((0.6 + Math.random() * 0.3) * SCALE);
+      this.decorations.push(rock);
+    });
+
+    // Add fountain in center of park (above the path)
+    const fountainY = grassTop + Math.round(30 * SCALE);
+    const fountainX = GAME_WIDTH / 2;
+    const fountain = this.add.sprite(fountainX, fountainY, "fountain");
+    fountain.setOrigin(0.5, 1);
+    fountain.setDepth(2);
+    fountain.setScale(SCALE);
+    this.decorations.push(fountain);
+
+    // Water spray particles - aligned with fountain top
+    this.fountainWater = this.add.particles(fountainX, fountainY - Math.round(35 * SCALE), "rain", {
+      speed: { min: Math.round(30 * SCALE), max: Math.round(60 * SCALE) },
+      angle: { min: 260, max: 280 },
+      lifespan: 500,
+      quantity: 3,
+      frequency: 80,
+      scale: { start: 0.4 * SCALE, end: 0.1 * SCALE },
+      alpha: { start: 0.7, end: 0 },
+      gravityY: Math.round(80 * SCALE),
+      tint: 0x60a5fa, // Blue tint for water
+    });
+    this.fountainWater.setDepth(2);
+
+    // Add flag poles (positioned at skyline/grass transition)
+    const flagY = grassTop - Math.round(20 * SCALE);
+    const flagPositions = [
+      { x: Math.round(50 * SCALE), y: flagY },
+      { x: Math.round(750 * SCALE), y: flagY },
+    ];
+    flagPositions.forEach((pos) => {
+      const flag = this.add.sprite(pos.x, pos.y, "flag");
+      flag.setOrigin(0.5, 1);
+      flag.setDepth(1);
+      this.decorations.push(flag);
+
+      // Flag waving
+      this.tweens.add({
+        targets: flag,
+        scaleX: 0.9 * SCALE,
+        duration: 800,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    });
+
+    // Add pond in corner (positioned on grass)
+    const pond = this.add.sprite(
+      Math.round(100 * SCALE),
+      grassTop + Math.round(50 * SCALE),
+      "pond"
+    );
+    pond.setOrigin(0.5, 0.5);
+    pond.setDepth(0);
+    pond.setScale(1.5 * SCALE);
+    pond.setAlpha(0.8);
+    this.decorations.push(pond);
+
+    // Ripple effect on pond (scaled)
+    this.tweens.add({
+      targets: pond,
+      scale: 1.55 * SCALE,
+      alpha: 0.6,
+      duration: 2000,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.easeInOut",
+    });
+  }
+
+  private createAmbientParticles(): void {
+    // Floating pollen/dust particles during day (scaled)
+    this.ambientParticles = this.add.particles(GAME_WIDTH / 2, Math.round(200 * SCALE), "pollen", {
+      x: { min: 0, max: GAME_WIDTH },
+      y: { min: Math.round(100 * SCALE), max: Math.round(400 * SCALE) },
+      lifespan: 8000,
+      speedX: { min: Math.round(5 * SCALE), max: Math.round(20 * SCALE) },
+      speedY: { min: Math.round(-5 * SCALE), max: Math.round(5 * SCALE) },
+      scale: { start: 0.3 * SCALE, end: 0 },
+      alpha: { start: 0.4, end: 0 },
+      quantity: 1,
+      frequency: 500,
+    });
+    this.ambientParticles.setDepth(15);
+  }
+
+  private createFireflies(): void {
+    if (this.fireflies) return;
+
+    this.fireflies = this.add.particles(GAME_WIDTH / 2, Math.round(400 * SCALE), "firefly", {
+      x: { min: Math.round(50 * SCALE), max: Math.round(750 * SCALE) },
+      y: { min: Math.round(350 * SCALE), max: Math.round(500 * SCALE) },
+      lifespan: 4000,
+      speedX: { min: Math.round(-20 * SCALE), max: Math.round(20 * SCALE) },
+      speedY: { min: Math.round(-20 * SCALE), max: Math.round(20 * SCALE) },
+      scale: { start: 0.8 * SCALE, end: 0 },
+      alpha: { start: 0, end: 1, ease: "Sine.easeInOut" },
+      quantity: 1,
+      frequency: 300,
+      tint: 0xffff00,
+      blendMode: Phaser.BlendModes.ADD,
+    });
+    this.fireflies.setDepth(20);
+  }
+
+  private showFireflies(): void {
+    if (!this.fireflies) {
+      this.createFireflies();
+    } else {
+      this.fireflies.start();
+      this.fireflies.setVisible(true);
+    }
+  }
+
+  private hideFireflies(): void {
+    if (this.fireflies) {
+      this.fireflies.stop();
+      this.fireflies.setVisible(false);
+    }
+  }
+
+  private startPokemonMusic(): void {
+    try {
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      this.gainNode = this.audioContext.createGain();
+      this.gainNode.connect(this.audioContext.destination);
+      this.gainNode.gain.value = 0.08; // Very low volume for ambient background
+
+      this.playCurrentTrack();
+      this.musicPlaying = true;
+      this.emitTrackChange();
+    } catch {
+      // Audio not supported
+    }
+  }
+
+  private emitTrackChange(): void {
+    window.dispatchEvent(
+      new CustomEvent("agencity-track-changed", {
+        detail: { trackName: this.trackNames[this.currentTrack], trackIndex: this.currentTrack },
+      })
+    );
+  }
+
+  private stopAllOscillators(): void {
+    // Stop all active oscillators immediately to prevent overlap
+    this.activeOscillators.forEach((osc) => {
+      try {
+        osc.stop();
+        osc.disconnect();
+      } catch {
+        // Oscillator may have already stopped
+      }
+    });
+    this.activeOscillators = [];
+  }
+
+  private playCurrentTrack(): void {
+    // Clear any existing scheduled track to prevent overlapping
+    if (this.musicInterval) {
+      clearTimeout(this.musicInterval);
+      this.musicInterval = null;
+    }
+
+    // Stop all currently playing oscillators
+    this.stopAllOscillators();
+
+    switch (this.currentTrack) {
+      case 0:
+        this.playPokemonMelody();
+        break;
+      case 1:
+        this.playBagsAnthem();
+        break;
+      case 2:
+        this.playNightMarket();
+        break;
+      case 3:
+        this.playVictoryMarch();
+        break;
+      case 4:
+        this.playRoute101();
+        break;
+      case 5:
+        this.playPokemonCenter();
+        break;
+      case 6:
+        this.playMysteryDungeon();
+        break;
+      default:
+        this.playPokemonMelody();
+    }
+  }
+
+  private skipTrack(): void {
+    // Stop current melody
+    if (this.musicInterval) {
+      clearTimeout(this.musicInterval);
+      this.musicInterval = null;
+    }
+
+    // Move to next track
+    this.currentTrack = (this.currentTrack + 1) % this.trackNames.length;
+    this.emitTrackChange();
+
+    // Play new track if music is on
+    if (this.musicPlaying && this.audioContext && this.gainNode) {
+      this.playCurrentTrack();
+    }
+  }
+
+  private prevTrack(): void {
+    // Stop current melody
+    if (this.musicInterval) {
+      clearTimeout(this.musicInterval);
+      this.musicInterval = null;
+    }
+
+    // Move to previous track (wrap around)
+    this.currentTrack = (this.currentTrack - 1 + this.trackNames.length) % this.trackNames.length;
+    this.emitTrackChange();
+
+    // Play new track if music is on
+    if (this.musicPlaying && this.audioContext && this.gainNode) {
+      this.playCurrentTrack();
+    }
+  }
+
+  private playPokemonMelody(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Ambient, relaxed pentatonic melody - much longer and less repetitive
+    // Slower tempo, longer notes, more space between phrases
+    const notes = [
+      // Phrase 1 - gentle opening
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 440.0, duration: 0.6 }, // A4
+      { freq: 523.25, duration: 1.0 }, // C5
+      { freq: 0, duration: 0.8 }, // Rest
+      { freq: 440.0, duration: 0.6 }, // A4
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 329.63, duration: 1.2 }, // E4
+      { freq: 0, duration: 1.0 }, // Long rest
+
+      // Phrase 2 - variation
+      { freq: 329.63, duration: 0.6 }, // E4
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 440.0, duration: 1.0 }, // A4
+      { freq: 0, duration: 0.6 }, // Rest
+      { freq: 523.25, duration: 0.8 }, // C5
+      { freq: 440.0, duration: 0.6 }, // A4
+      { freq: 392.0, duration: 1.2 }, // G4
+      { freq: 0, duration: 1.2 }, // Long rest
+
+      // Phrase 3 - descending
+      { freq: 523.25, duration: 0.8 }, // C5
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 329.63, duration: 1.0 }, // E4
+      { freq: 0, duration: 0.8 }, // Rest
+      { freq: 293.66, duration: 0.6 }, // D4
+      { freq: 261.63, duration: 1.4 }, // C4
+      { freq: 0, duration: 1.5 }, // Long rest
+
+      // Phrase 4 - resolution
+      { freq: 261.63, duration: 0.8 }, // C4
+      { freq: 329.63, duration: 0.6 }, // E4
+      { freq: 392.0, duration: 1.0 }, // G4
+      { freq: 0, duration: 0.5 }, // Rest
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 392.0, duration: 1.2 }, // G4
+      { freq: 0, duration: 2.0 }, // Very long rest before loop
+    ];
+
+    // Soft, sustained bass notes (much quieter)
+    const bass = [
+      { freq: 130.81, duration: 3.0 }, // C3
+      { freq: 0, duration: 1.0 },
+      { freq: 110.0, duration: 3.0 }, // A2
+      { freq: 0, duration: 1.0 },
+      { freq: 98.0, duration: 3.0 }, // G2
+      { freq: 0, duration: 1.0 },
+      { freq: 130.81, duration: 4.0 }, // C3
+      { freq: 0, duration: 2.0 },
+      { freq: 110.0, duration: 3.0 }, // A2
+      { freq: 0, duration: 1.5 },
+      { freq: 98.0, duration: 3.0 }, // G2
+      { freq: 0, duration: 2.5 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    // Play melody with sine waves
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.85, 0.08, "sine");
+      }
+      time += note.duration;
+    });
+
+    // Play bass with triangle waves (very quiet)
+    let bassTime = this.audioContext.currentTime + 0.1;
+    bass.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.04, "triangle");
+      }
+      bassTime += note.duration;
+    });
+
+    // Loop with extra pause
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  // Track 2: Bags Anthem - Gentle, uplifting
+  private playBagsAnthem(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Gentle uplifting melody - longer phrases, more space
+    const notes = [
+      { freq: 329.63, duration: 0.8 }, // E4
+      { freq: 392.0, duration: 0.6 }, // G4
+      { freq: 493.88, duration: 1.0 }, // B4
+      { freq: 0, duration: 0.6 }, // Rest
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 392.0, duration: 0.6 }, // G4
+      { freq: 329.63, duration: 1.2 }, // E4
+      { freq: 0, duration: 1.0 }, // Long rest
+
+      { freq: 392.0, duration: 0.6 }, // G4
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 493.88, duration: 0.8 }, // B4
+      { freq: 523.25, duration: 1.0 }, // C5
+      { freq: 0, duration: 0.8 }, // Rest
+      { freq: 493.88, duration: 0.6 }, // B4
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 392.0, duration: 1.2 }, // G4
+      { freq: 0, duration: 1.2 }, // Long rest
+
+      { freq: 329.63, duration: 0.8 }, // E4
+      { freq: 293.66, duration: 0.6 }, // D4
+      { freq: 329.63, duration: 1.0 }, // E4
+      { freq: 392.0, duration: 1.2 }, // G4
+      { freq: 0, duration: 2.0 }, // Very long rest
+    ];
+
+    const bass = [
+      { freq: 164.81, duration: 3.5 }, // E3
+      { freq: 0, duration: 1.0 },
+      { freq: 130.81, duration: 3.5 }, // C3
+      { freq: 0, duration: 1.0 },
+      { freq: 146.83, duration: 3.0 }, // D3
+      { freq: 0, duration: 1.0 },
+      { freq: 164.81, duration: 3.5 }, // E3
+      { freq: 0, duration: 2.0 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.85, 0.07, "sine");
+      }
+      time += note.duration;
+    });
+
+    let bassTime = this.audioContext.currentTime + 0.1;
+    bass.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.03, "triangle");
+      }
+      bassTime += note.duration;
+    });
+
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  // Track 3: Night Market - Chill, ambient
+  private playNightMarket(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Chill ambient melody - very spacious and relaxed
+    const notes = [
+      { freq: 293.66, duration: 1.2 }, // D4
+      { freq: 0, duration: 0.8 }, // Rest
+      { freq: 329.63, duration: 1.0 }, // E4
+      { freq: 392.0, duration: 1.4 }, // G4
+      { freq: 0, duration: 1.2 }, // Long rest
+
+      { freq: 440.0, duration: 1.0 }, // A4
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 329.63, duration: 1.4 }, // E4
+      { freq: 0, duration: 1.0 }, // Rest
+
+      { freq: 293.66, duration: 0.8 }, // D4
+      { freq: 261.63, duration: 1.2 }, // C4
+      { freq: 0, duration: 1.5 }, // Long rest
+
+      { freq: 329.63, duration: 1.0 }, // E4
+      { freq: 293.66, duration: 0.8 }, // D4
+      { freq: 261.63, duration: 1.6 }, // C4
+      { freq: 0, duration: 2.0 }, // Very long rest
+
+      { freq: 392.0, duration: 1.2 }, // G4
+      { freq: 329.63, duration: 1.0 }, // E4
+      { freq: 293.66, duration: 1.4 }, // D4
+      { freq: 0, duration: 2.5 }, // Extra long rest before loop
+    ];
+
+    const pad = [
+      { freq: 130.81, duration: 4.0 }, // C3
+      { freq: 0, duration: 1.5 },
+      { freq: 110.0, duration: 4.0 }, // A2
+      { freq: 0, duration: 1.5 },
+      { freq: 98.0, duration: 4.0 }, // G2
+      { freq: 0, duration: 1.5 },
+      { freq: 130.81, duration: 5.0 }, // C3
+      { freq: 0, duration: 2.0 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.9, 0.06, "sine");
+      }
+      time += note.duration;
+    });
+
+    let padTime = this.audioContext.currentTime + 0.1;
+    pad.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, padTime, note.duration * 0.95, 0.03, "sine");
+      }
+      padTime += note.duration;
+    });
+
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  // Track 4: Victory March - Gentle, hopeful
+  private playVictoryMarch(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Gentle hopeful melody - uplifting but calm
+    const notes = [
+      { freq: 392.0, duration: 1.0 }, // G4
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 493.88, duration: 1.2 }, // B4
+      { freq: 0, duration: 0.8 }, // Rest
+
+      { freq: 523.25, duration: 1.0 }, // C5
+      { freq: 493.88, duration: 0.8 }, // B4
+      { freq: 440.0, duration: 1.2 }, // A4
+      { freq: 0, duration: 1.0 }, // Long rest
+
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 329.63, duration: 0.8 }, // E4
+      { freq: 392.0, duration: 1.0 }, // G4
+      { freq: 440.0, duration: 1.4 }, // A4
+      { freq: 0, duration: 1.2 }, // Long rest
+
+      { freq: 493.88, duration: 1.0 }, // B4
+      { freq: 523.25, duration: 1.2 }, // C5
+      { freq: 0, duration: 0.6 }, // Rest
+      { freq: 493.88, duration: 0.8 }, // B4
+      { freq: 440.0, duration: 1.0 }, // A4
+      { freq: 392.0, duration: 1.6 }, // G4
+      { freq: 0, duration: 2.5 }, // Very long rest before loop
+    ];
+
+    const bass = [
+      { freq: 196.0, duration: 4.0 }, // G3
+      { freq: 0, duration: 1.0 },
+      { freq: 130.81, duration: 4.0 }, // C3
+      { freq: 0, duration: 1.0 },
+      { freq: 164.81, duration: 3.5 }, // E3
+      { freq: 0, duration: 1.5 },
+      { freq: 196.0, duration: 5.0 }, // G3
+      { freq: 0, duration: 2.0 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.85, 0.07, "sine");
+      }
+      time += note.duration;
+    });
+
+    let bassTime = this.audioContext.currentTime + 0.1;
+    bass.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.03, "triangle");
+      }
+      bassTime += note.duration;
+    });
+
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  // Track 5: Route 101 - Cheerful walking/exploration theme
+  private playRoute101(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Cheerful, bouncy melody - reminiscent of Pokemon routes
+    const notes = [
+      // Opening phrase - bright and cheerful
+      { freq: 523.25, duration: 0.4 }, // C5
+      { freq: 587.33, duration: 0.4 }, // D5
+      { freq: 659.25, duration: 0.6 }, // E5
+      { freq: 0, duration: 0.3 }, // Rest
+      { freq: 587.33, duration: 0.4 }, // D5
+      { freq: 523.25, duration: 0.6 }, // C5
+      { freq: 0, duration: 0.5 }, // Rest
+
+      // Second phrase - playful variation
+      { freq: 440.0, duration: 0.4 }, // A4
+      { freq: 523.25, duration: 0.4 }, // C5
+      { freq: 587.33, duration: 0.5 }, // D5
+      { freq: 659.25, duration: 0.7 }, // E5
+      { freq: 0, duration: 0.6 }, // Rest
+
+      // Third phrase - descending
+      { freq: 659.25, duration: 0.4 }, // E5
+      { freq: 587.33, duration: 0.4 }, // D5
+      { freq: 523.25, duration: 0.4 }, // C5
+      { freq: 440.0, duration: 0.6 }, // A4
+      { freq: 0, duration: 0.8 }, // Rest
+
+      // Resolution phrase
+      { freq: 392.0, duration: 0.5 }, // G4
+      { freq: 440.0, duration: 0.4 }, // A4
+      { freq: 523.25, duration: 0.8 }, // C5
+      { freq: 0, duration: 1.5 }, // Long rest before loop
+    ];
+
+    const bass = [
+      { freq: 130.81, duration: 2.0 }, // C3
+      { freq: 0, duration: 0.5 },
+      { freq: 110.0, duration: 2.0 }, // A2
+      { freq: 0, duration: 0.5 },
+      { freq: 146.83, duration: 2.0 }, // D3
+      { freq: 0, duration: 0.5 },
+      { freq: 130.81, duration: 2.5 }, // C3
+      { freq: 0, duration: 1.5 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.85, 0.08, "sine");
+      }
+      time += note.duration;
+    });
+
+    let bassTime = this.audioContext.currentTime + 0.1;
+    bass.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.04, "triangle");
+      }
+      bassTime += note.duration;
+    });
+
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  // Track 6: Pokemon Center - Healing/rest theme
+  private playPokemonCenter(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Soothing, comforting melody - the classic healing feel
+    const notes = [
+      // Iconic opening
+      { freq: 659.25, duration: 0.5 }, // E5
+      { freq: 783.99, duration: 0.5 }, // G5
+      { freq: 880.0, duration: 0.7 }, // A5
+      { freq: 0, duration: 0.4 }, // Rest
+      { freq: 783.99, duration: 0.4 }, // G5
+      { freq: 659.25, duration: 0.6 }, // E5
+      { freq: 0, duration: 0.8 }, // Rest
+
+      // Gentle continuation
+      { freq: 523.25, duration: 0.5 }, // C5
+      { freq: 587.33, duration: 0.4 }, // D5
+      { freq: 659.25, duration: 0.6 }, // E5
+      { freq: 0, duration: 0.5 }, // Rest
+      { freq: 587.33, duration: 0.4 }, // D5
+      { freq: 523.25, duration: 0.8 }, // C5
+      { freq: 0, duration: 1.0 }, // Rest
+
+      // Resolving phrase
+      { freq: 440.0, duration: 0.5 }, // A4
+      { freq: 523.25, duration: 0.5 }, // C5
+      { freq: 659.25, duration: 0.7 }, // E5
+      { freq: 0, duration: 0.4 }, // Rest
+      { freq: 523.25, duration: 0.5 }, // C5
+      { freq: 440.0, duration: 0.8 }, // A4
+      { freq: 0, duration: 2.0 }, // Long rest
+    ];
+
+    const pad = [
+      { freq: 220.0, duration: 3.0 }, // A3
+      { freq: 0, duration: 1.0 },
+      { freq: 261.63, duration: 3.0 }, // C4
+      { freq: 0, duration: 1.0 },
+      { freq: 220.0, duration: 3.5 }, // A3
+      { freq: 0, duration: 2.0 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.9, 0.07, "sine");
+      }
+      time += note.duration;
+    });
+
+    let padTime = this.audioContext.currentTime + 0.1;
+    pad.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, padTime, note.duration * 0.95, 0.03, "sine");
+      }
+      padTime += note.duration;
+    });
+
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  // Track 7: Mystery Dungeon - Mysterious exploration theme
+  private playMysteryDungeon(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    // Mysterious, slightly tense but adventurous melody
+    const notes = [
+      // Opening - mysterious
+      { freq: 329.63, duration: 0.8 }, // E4
+      { freq: 0, duration: 0.4 }, // Rest
+      { freq: 311.13, duration: 0.6 }, // Eb4
+      { freq: 329.63, duration: 0.8 }, // E4
+      { freq: 0, duration: 0.6 }, // Rest
+
+      // Building tension
+      { freq: 392.0, duration: 0.6 }, // G4
+      { freq: 369.99, duration: 0.5 }, // F#4
+      { freq: 329.63, duration: 0.7 }, // E4
+      { freq: 0, duration: 0.8 }, // Rest
+
+      // Mysterious phrase
+      { freq: 293.66, duration: 0.6 }, // D4
+      { freq: 329.63, duration: 0.5 }, // E4
+      { freq: 392.0, duration: 0.8 }, // G4
+      { freq: 0, duration: 0.5 }, // Rest
+      { freq: 369.99, duration: 0.6 }, // F#4
+      { freq: 329.63, duration: 1.0 }, // E4
+      { freq: 0, duration: 1.0 }, // Rest
+
+      // Resolution with minor feel
+      { freq: 261.63, duration: 0.7 }, // C4
+      { freq: 293.66, duration: 0.5 }, // D4
+      { freq: 329.63, duration: 1.2 }, // E4
+      { freq: 0, duration: 2.0 }, // Long rest before loop
+    ];
+
+    const bass = [
+      { freq: 82.41, duration: 3.0 }, // E2
+      { freq: 0, duration: 1.0 },
+      { freq: 98.0, duration: 3.0 }, // G2
+      { freq: 0, duration: 1.0 },
+      { freq: 73.42, duration: 3.0 }, // D2
+      { freq: 0, duration: 1.0 },
+      { freq: 82.41, duration: 3.5 }, // E2
+      { freq: 0, duration: 2.0 },
+    ];
+
+    let time = this.audioContext.currentTime + 0.1;
+    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
+
+    notes.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, time, note.duration * 0.85, 0.07, "sine");
+      }
+      time += note.duration;
+    });
+
+    let bassTime = this.audioContext.currentTime + 0.1;
+    bass.forEach((note) => {
+      if (note.freq > 0) {
+        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.04, "triangle");
+      }
+      bassTime += note.duration;
+    });
+
+    this.musicInterval = window.setTimeout(
+      () => {
+        if (this.musicPlaying) {
+          this.playCurrentTrack();
+        }
+      },
+      (totalDuration + 2) * 1000
+    );
+  }
+
+  private playSpawnSfx(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    const t = this.audioContext.currentTime + 0.05;
+    // 4-note ascending arpeggio: C5→E5→G5→C6 (square wave)
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((freq, i) => {
+      this.playNote(freq, t + i * 0.1, 0.1, 0.05, "square");
+    });
+
+    // Subtle sine sweep underneath (200→800 Hz over 0.3s)
+    const sweep = this.audioContext.createOscillator();
+    const sweepGain = this.audioContext.createGain();
+    sweep.type = "sine";
+    sweep.frequency.setValueAtTime(200, t);
+    sweep.frequency.exponentialRampToValueAtTime(800, t + 0.3);
+    sweepGain.gain.setValueAtTime(0.03, t);
+    sweepGain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+    sweep.connect(sweepGain);
+    sweepGain.connect(this.gainNode);
+    sweep.start(t);
+    sweep.stop(t + 0.35);
+  }
+
+  private playExitSfx(): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    const t = this.audioContext.currentTime + 0.05;
+    // 3-note descending: G5→E5→C5
+    const notes = [783.99, 659.25, 523.25];
+    notes.forEach((freq, i) => {
+      this.playNote(freq, t + i * 0.1, 0.12, 0.04, "square");
+    });
+  }
+
+  // Short 2-note ascending blip for NPC/building interaction confirm
+  private playInteractSfx(): void {
+    if (!this.audioContext || !this.gainNode) return;
+    const t = this.audioContext.currentTime + 0.02;
+    // E5 → A5 — bright, friendly confirm
+    this.playNote(659.25, t, 0.06, 0.05, "square");
+    this.playNote(880.0, t + 0.07, 0.08, 0.05, "square");
+  }
+
+  // Filtered noise sweep for zone transitions — whoosh feel
+  private playZoneTransitionSfx(): void {
+    if (!this.audioContext || !this.gainNode) return;
+    const t = this.audioContext.currentTime + 0.02;
+
+    // White noise burst shaped by a bandpass filter sweep
+    const bufferSize = this.audioContext.sampleRate * 0.4;
+    const buffer = this.audioContext.createBuffer(1, bufferSize, this.audioContext.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    const noise = this.audioContext.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = this.audioContext.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.setValueAtTime(200, t);
+    filter.frequency.exponentialRampToValueAtTime(2000, t + 0.15);
+    filter.frequency.exponentialRampToValueAtTime(400, t + 0.35);
+    filter.Q.value = 1.5;
+
+    const noiseGain = this.audioContext.createGain();
+    noiseGain.gain.setValueAtTime(0, t);
+    noiseGain.gain.linearRampToValueAtTime(0.06, t + 0.05);
+    noiseGain.gain.linearRampToValueAtTime(0.04, t + 0.2);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+
+    noise.connect(filter);
+    filter.connect(noiseGain);
+    noiseGain.connect(this.gainNode);
+    noise.start(t);
+    noise.stop(t + 0.4);
+  }
+
+  // Dramatic 3-note sting for wild creature encounters — tension chord
+  private playEncounterSfx(): void {
+    if (!this.audioContext || !this.gainNode) return;
+    const t = this.audioContext.currentTime + 0.02;
+    // C4 → Eb4 → G4 (minor triad, staccato, loud) — danger feel
+    this.playNote(261.63, t, 0.08, 0.06, "square");
+    this.playNote(311.13, t + 0.09, 0.08, 0.06, "square");
+    this.playNote(392.0, t + 0.18, 0.15, 0.07, "square");
+    // Low bass hit underneath
+    this.playNote(130.81, t, 0.25, 0.04, "triangle");
+  }
+
+  // Soft confirmation tone for building modal open
+  private playBuildingClickSfx(): void {
+    if (!this.audioContext || !this.gainNode) return;
+    const t = this.audioContext.currentTime + 0.02;
+    // Single warm note with slight vibrato — C5 sine
+    const osc = this.audioContext.createOscillator();
+    const oscGain = this.audioContext.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(523.25, t);
+    // Gentle vibrato
+    const lfo = this.audioContext.createOscillator();
+    const lfoGain = this.audioContext.createGain();
+    lfo.frequency.value = 6;
+    lfoGain.gain.value = 3;
+    lfo.connect(lfoGain);
+    lfoGain.connect(osc.frequency);
+    lfo.start(t);
+    lfo.stop(t + 0.25);
+
+    oscGain.gain.setValueAtTime(0, t);
+    oscGain.gain.linearRampToValueAtTime(0.04, t + 0.02);
+    oscGain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    osc.connect(oscGain);
+    oscGain.connect(this.gainNode);
+    osc.start(t);
+    osc.stop(t + 0.25);
+  }
+
+  // One-shot gold star burst at a world point — visual companion to
+  // playBuildingClickSfx so building clicks read as "the world reacted."
+  // Uses the existing `star` texture from weather-ui.ts (gold 16x16).
+  // Self-destroys 100ms after particles finish so no leak.
+  private playBuildingClickBurst(worldX: number, worldY: number): void {
+    const burst = this.add.particles(worldX, worldY, "star", {
+      speed: { min: 70, max: 170 },
+      angle: { min: 0, max: 360 },
+      lifespan: 450,
+      scale: { start: 0.9, end: 0 },
+      alpha: { start: 1, end: 0 },
+      rotate: { min: 0, max: 360 },
+      gravityY: 80, // gentle fall — sparks arc instead of flying flat
+      emitting: false,
+    });
+    // Depth 20: above buildings (5–8) and characters (10–12), below
+    // interactPrompt (150) and zone-transition overlays (50).
+    burst.setDepth(20);
+    burst.explode(8);
+    this.time.delayedCall(550, () => burst.destroy());
+  }
+
+  private playNote(
+    frequency: number,
+    startTime: number,
+    duration: number,
+    volume: number,
+    waveType: OscillatorType = "sine"
+  ): void {
+    if (!this.audioContext || !this.gainNode) return;
+
+    const oscillator = this.audioContext.createOscillator();
+    const noteGain = this.audioContext.createGain();
+
+    // Add a low-pass filter for smoother sound
+    const filter = this.audioContext.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 2000;
+    filter.Q.value = 0.5;
+
+    oscillator.connect(filter);
+    filter.connect(noteGain);
+    noteGain.connect(this.gainNode);
+
+    // Use sine wave for clean, smooth sound (triangle for slight warmth)
+    oscillator.type = waveType;
+    oscillator.frequency.value = frequency;
+
+    // Smooth envelope with longer attack/release for ambient feel
+    const attackTime = Math.min(0.08, duration * 0.15);
+    const releaseTime = Math.min(0.15, duration * 0.3);
+
+    noteGain.gain.setValueAtTime(0, startTime);
+    noteGain.gain.linearRampToValueAtTime(volume, startTime + attackTime);
+    noteGain.gain.setValueAtTime(volume * 0.8, startTime + duration - releaseTime);
+    noteGain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+
+    oscillator.start(startTime);
+    oscillator.stop(startTime + duration + 0.01);
+
+    // Track oscillator for cleanup on track switch
+    this.activeOscillators.push(oscillator);
+
+    // Remove from array when it ends naturally
+    oscillator.onended = () => {
+      const index = this.activeOscillators.indexOf(oscillator);
+      if (index > -1) {
+        this.activeOscillators.splice(index, 1);
+      }
+    };
+  }
+
+  private toggleMusic(): void {
+    if (this.musicPlaying) {
+      this.musicPlaying = false;
+      if (this.musicInterval) {
+        clearTimeout(this.musicInterval);
+        this.musicInterval = null;
+      }
+      // Stop all active oscillators when muting
+      this.stopAllOscillators();
+      if (this.gainNode) {
+        this.gainNode.gain.value = 0;
+      }
+    } else {
+      this.musicPlaying = true;
+      if (this.gainNode) {
+        this.gainNode.gain.value = 0.08;
+      }
+      this.playCurrentTrack();
+    }
+  }
+
+  update(): void {
+    // Update local player movement (WASD/arrow keys + tap-to-move on mobile)
+    this.updateLocalPlayer();
+
+    // Update speech bubbles for autonomous dialogue
+    this.updateDialogueBubbles();
+
+    // Update character movements with AI-driven targets
+    // Performance: use O(1) map lookup instead of O(n) find()
+    this.characterSprites.forEach((sprite, id) => {
+      const character = this.characterById.get(id);
+      if (!character) return;
+
+      // Get character's behavior ID (special characters map to their IDs)
+      const behaviorId = this.getCharacterBehaviorId(character);
+      const target = this.characterTargets.get(behaviorId);
+
+      if (target) {
+        // AI-driven movement toward target
+        const dx = target.x - sprite.x;
+        const dy = target.y - sprite.y;
+        // Performance: use squared distance to avoid sqrt when possible
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq > 25) {
+          // 5^2 = 25
+          const distance = Math.sqrt(distSq);
+          // Performance: cache speed per character instead of random every frame
+          let speed = this.characterSpeeds.get(id);
+          if (!speed) {
+            speed = 1.2 + Math.random() * 0.3;
+            this.characterSpeeds.set(id, speed);
+          }
+          const moveX = (dx / distance) * speed;
+          const moveY = (dy / distance) * speed;
+
+          sprite.x += moveX;
+          sprite.y += moveY;
+
+          // Face direction of movement
+          sprite.setFlipX(dx < 0);
+
+          // Update any glow sprites, visitor sparkles, shadow
+          this.updateCharacterGlow(sprite, character);
+          this.updateVisitorSparkle(sprite);
+          this.syncShadow(sprite);
+          if (this.isMobile) this.updateMobileLabel(sprite);
+        } else {
+          // Reached target, clear it and reset speed for next movement
+          this.characterTargets.delete(behaviorId);
+          this.characterSpeeds.delete(id);
+        }
+      } else if (character.isMoving) {
+        // Fallback: simple random wandering if no AI target
+        // Performance: cache fallback speed too
+        let speed = this.characterSpeeds.get(id);
+        if (!speed) {
+          speed = 0.3 + Math.random() * 0.2;
+          this.characterSpeeds.set(id, speed);
+        }
+        if (character.direction === "left") {
+          sprite.x -= speed;
+          sprite.setFlipX(true);
+          if (sprite.x < 100) {
+            character.direction = "right";
+            this.characterSpeeds.delete(id); // Reset speed on direction change
+          }
+        } else {
+          sprite.x += speed;
+          sprite.setFlipX(false);
+          if (sprite.x > 1100) {
+            character.direction = "left";
+            this.characterSpeeds.delete(id); // Reset speed on direction change
+          }
+        }
+        // Update glow, visitor sparkles, shadow on fallback movement too
+        this.updateCharacterGlow(sprite, character);
+        this.updateVisitorSparkle(sprite);
+        this.syncShadow(sprite);
+        if (this.isMobile) this.updateMobileLabel(sprite);
+      }
+    });
+
+    // Animate clouds with parallax
+    this.clouds.forEach((cloud, i) => {
+      cloud.x += 0.15 + i * 0.05;
+      if (cloud.x > 870) {
+        cloud.x = -70;
+        cloud.y = 30 + Math.random() * 120;
+      }
+    });
+
+    // Animate animals (scaled for 1280x960 resolution)
+    const animalMinX = Math.round(50 * SCALE);
+    const animalMaxX = Math.round(750 * SCALE);
+    const animalRoamRange = Math.round(700 * SCALE);
+
+    this.animals.forEach((animal) => {
+      if (animal.isIdle) {
+        animal.idleTimer += 1;
+        // After idle period, start moving again
+        if (animal.idleTimer > 100 + Math.random() * 200) {
+          animal.isIdle = false;
+          animal.idleTimer = 0;
+          animal.targetX = animalMinX + Math.random() * animalRoamRange;
+          animal.direction = animal.targetX > animal.sprite.x ? "right" : "left";
+        }
+      } else {
+        // Move toward target
+        const dx = animal.targetX - animal.sprite.x;
+        if (Math.abs(dx) < 5 * SCALE) {
+          // Reached target, become idle
+          animal.isIdle = true;
+        } else {
+          animal.sprite.x += animal.speed * (dx > 0 ? 1 : -1);
+          animal.sprite.setFlipX(dx < 0);
+        }
+
+        // Keep within bounds (scaled)
+        if (animal.sprite.x < animalMinX) {
+          animal.sprite.x = animalMinX;
+          animal.targetX = animalMinX + Math.random() * Math.round(300 * SCALE);
+        }
+        if (animal.sprite.x > animalMaxX) {
+          animal.sprite.x = animalMaxX;
+          animal.targetX = Math.round(400 * SCALE) + Math.random() * Math.round(350 * SCALE);
+        }
+      }
+    });
+
+    // === POKEMON MOVEMENT (Founders zone only) ===
+    if (this.currentZone === "founders") {
+      const pokemonMinX = Math.round(80 * SCALE);
+      const pokemonMaxX = Math.round(720 * SCALE);
+
+      this.pokemon.forEach((poke) => {
+        if (!poke.sprite.active) return;
+
+        if (!poke.isIdle) {
+          // Move toward target
+          const dx = poke.targetX - poke.sprite.x;
+          if (Math.abs(dx) < 5 * SCALE) {
+            // Reached target, become idle
+            poke.isIdle = true;
+            poke.idleTimer = 0;
+          } else {
+            poke.sprite.x += poke.speed * SCALE * (dx > 0 ? 1 : -1);
+            poke.sprite.setFlipX(dx < 0);
+          }
+
+          // Keep within bounds
+          if (poke.sprite.x < pokemonMinX) {
+            poke.sprite.x = pokemonMinX;
+            poke.isIdle = true;
+            poke.targetX = pokemonMinX + Math.random() * Math.round(200 * SCALE);
+          }
+          if (poke.sprite.x > pokemonMaxX) {
+            poke.sprite.x = pokemonMaxX;
+            poke.isIdle = true;
+            poke.targetX = pokemonMaxX - Math.random() * Math.round(200 * SCALE);
+          }
+        }
+      });
+    }
+
+    // === BEACH CRAB/LOBSTER MOVEMENT (Moltbook Beach zone only) ===
+    if (this.currentZone === "moltbook") {
+      const crabMinX = Math.round(60 * SCALE);
+      const crabMaxX = Math.round(740 * SCALE);
+      const crabRoamRange = Math.round(600 * SCALE);
+
+      // Helper to update a single crab/lobster/hermit creature movement
+      const updateCreatureMovement = (crab: BeachCrab) => {
+        if (!crab.sprite || !crab.sprite.active) return;
+
+        if (crab.isIdle) {
+          crab.idleTimer += 1;
+
+          // Idle claw snap: random chance for a quick scale pulse (visual "snap")
+          if (crab.idleTimer % 60 === 0 && Math.random() < 0.08) {
+            this.tweens.add({
+              targets: crab.sprite,
+              scaleX: crab.sprite.scaleX * 1.15,
+              scaleY: crab.sprite.scaleY * 1.12,
+              duration: 100,
+              yoyo: true,
+              ease: "Quad.easeOut",
+            });
+          }
+
+          // Crabs idle longer than regular animals - they're chill beach vibes
+          if (crab.idleTimer > 150 + Math.random() * 250) {
+            crab.isIdle = false;
+            crab.idleTimer = 0;
+            crab.targetX = crabMinX + Math.random() * crabRoamRange;
+            crab.direction = crab.targetX > crab.sprite.x ? "right" : "left";
+          }
+        } else {
+          // Move toward target (crabs are slower, more deliberate)
+          const dx = crab.targetX - crab.sprite.x;
+          if (Math.abs(dx) < 5 * SCALE) {
+            // Reached target, become idle
+            crab.isIdle = true;
+            crab.idleTimer = 0;
+          } else {
+            crab.sprite.x += crab.speed * (dx > 0 ? 1 : -1);
+            crab.sprite.setFlipX(dx < 0);
+          }
+
+          // Keep within beach bounds
+          if (crab.sprite.x < crabMinX) {
+            crab.sprite.x = crabMinX;
+            crab.targetX = crabMinX + Math.random() * Math.round(200 * SCALE);
+            crab.isIdle = true;
+          }
+          if (crab.sprite.x > crabMaxX) {
+            crab.sprite.x = crabMaxX;
+            crab.targetX = crabMaxX - Math.random() * Math.round(200 * SCALE);
+            crab.isIdle = true;
+          }
+        }
+      };
+
+      // Update external agent crabs/lobsters
+      this.beachCrabs.forEach(updateCreatureMovement);
+
+      // Update ambient creatures (always-present beach life)
+      this.ambientCreatures.forEach(updateCreatureMovement);
+    }
+  }
+
+  updateWorldState(state: WorldState): void {
+    const previousState = this.worldState;
+    this.worldState = state;
+    this.worldStateVersion++;
+
+    // IMPORTANT: Update day/night FIRST so weather effects know the time
+    // Always update time info to ensure correct celestial bodies
+    if (state.timeInfo) {
+      this.updateDayNightFromEST(state.timeInfo);
+    } else {
+      console.warn("[AgenCity] No timeInfo in state!");
+    }
+
+    // Update weather AFTER time is set (check if weather changed OR if this is first load)
+    if (!previousState || previousState.weather !== state.weather) {
+      this.updateWeather(state.weather);
+    }
+
+    // Update characters
+    this.updateCharacters(state.population);
+
+    // Update buildings
+    this.updateBuildings(state.buildings);
+
+    // Trigger events
+    if (state.events.length > 0 && previousState) {
+      const newEvents = state.events.filter(
+        (e) => !previousState.events.find((pe) => pe.id === e.id)
+      );
+      newEvents.forEach((event) => this.triggerEvent(event));
+    }
+  }
+
+  private currentTimeInfo: { isNight: boolean; isDusk: boolean; isDawn: boolean } | null = null;
+
+  private updateDayNightFromEST(timeInfo: {
+    isNight: boolean;
+    isDusk: boolean;
+    isDawn: boolean;
+  }): void {
+    const wasNight = this.currentTimeInfo?.isNight;
+    this.currentTimeInfo = timeInfo;
+    let alpha = 0;
+    let tint = 0x000000;
+
+    if (timeInfo.isNight) {
+      // Night (8 PM to 6 AM EST) - deep blue overlay
+      alpha = 0.45;
+      tint = 0x0a0a2e;
+      // Show fireflies at night (created once, then toggled)
+      this.showFireflies();
+      // Hide ambient particles at night
+      if (this.ambientParticles) {
+        this.ambientParticles.stop();
+        this.ambientParticles.setVisible(false);
+      }
+    } else if (timeInfo.isDusk) {
+      // Dusk (6 PM to 8 PM EST) - warm orange/purple
+      alpha = 0.25;
+      tint = 0x4a2a3e;
+      // Start showing some fireflies at dusk
+      this.showFireflies();
+    } else if (timeInfo.isDawn) {
+      // Dawn (6 AM to 8 AM EST) - soft golden
+      alpha = 0.2;
+      tint = 0x3a2a1e;
+      // Hide fireflies at dawn
+      this.hideFireflies();
+      if (this.ambientParticles) {
+        this.ambientParticles.start();
+        this.ambientParticles.setVisible(true);
+      }
+    } else {
+      // Daytime - hide fireflies, show ambient particles
+      if (wasNight || this.currentTimeInfo === null) {
+        this.hideFireflies();
+        if (this.ambientParticles) {
+          this.ambientParticles.start();
+          this.ambientParticles.setVisible(true);
+        }
+      }
+    }
+
+    // Set the fill style first, then animate alpha
+    if (alpha > 0) {
+      this.overlay.setFillStyle(tint, 1); // Set full color, alpha controlled by tween
+    }
+
+    // Smoothly transition the overlay alpha
+    this.tweens.add({
+      targets: this.overlay,
+      alpha,
+      duration: 3000,
+      ease: "Sine.easeInOut",
+    });
+
+    // Update sun/moon based on time - IMPORTANT: do this AFTER setting currentTimeInfo
+    this.updateCelestialBody(timeInfo);
+
+    // Update sky color and stars based on time
+    this.updateSkyForTime(timeInfo);
+
+    // If it's night and we have a sun, remove it immediately
+    if (timeInfo.isNight && this.sunSprite) {
+      this.sunSprite.destroy();
+      this.sunSprite = null;
+    }
+  }
+
+  private moonSprite: Phaser.GameObjects.Sprite | null = null;
+  private starsContainer: Phaser.GameObjects.Container | null = null;
+
+  private updateCelestialBody(timeInfo: {
+    isNight: boolean;
+    isDusk: boolean;
+    isDawn: boolean;
+  }): void {
+    // Remove existing sun if it's nighttime
+    if (timeInfo.isNight && this.sunSprite) {
+      this.tweens.add({
+        targets: this.sunSprite,
+        alpha: 0,
+        y: 150,
+        duration: 2000,
+        onComplete: () => {
+          this.sunSprite?.destroy();
+          this.sunSprite = null;
+        },
+      });
+    }
+
+    // Show moon at night
+    if (timeInfo.isNight && !this.moonSprite) {
+      this.moonSprite = this.add.sprite(650, 80, "moon");
+      this.moonSprite.setScale(1.5);
+      this.moonSprite.setAlpha(0);
+      this.moonSprite.setDepth(0);
+
+      this.tweens.add({
+        targets: this.moonSprite,
+        alpha: 0.9,
+        duration: 2000,
+      });
+
+      // Gentle moon glow
+      this.tweens.add({
+        targets: this.moonSprite,
+        scale: 1.6,
+        duration: 4000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Hide moon during day
+    if (!timeInfo.isNight && this.moonSprite) {
+      this.tweens.add({
+        targets: this.moonSprite,
+        alpha: 0,
+        duration: 2000,
+        onComplete: () => {
+          this.moonSprite?.destroy();
+          this.moonSprite = null;
+        },
+      });
+    }
+
+    // Show sun during daytime (not night, not dusk)
+    if (!timeInfo.isNight && !timeInfo.isDusk && !this.sunSprite) {
+      this.sunSprite = this.add.sprite(150, 80, "sun");
+      this.sunSprite.setScale(2);
+      this.sunSprite.setAlpha(0);
+      this.sunSprite.setDepth(0);
+      this.sunSprite.setTint(0xffdd44);
+
+      // Fade in the sun
+      this.tweens.add({
+        targets: this.sunSprite,
+        alpha: 0.9,
+        y: 60,
+        duration: 2000,
+      });
+
+      // Gentle sun pulse
+      this.tweens.add({
+        targets: this.sunSprite,
+        scale: 2.1,
+        duration: 3000,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Hide sun at dusk (transition period)
+    if (timeInfo.isDusk && this.sunSprite) {
+      this.tweens.add({
+        targets: this.sunSprite,
+        alpha: 0.4,
+        y: 120,
+        duration: 2000,
+      });
+    }
+  }
+
+  private updateWeather(weather: WorldState["weather"]): void {
+    // Clear existing weather effects
+    if (this.weatherEmitter) {
+      this.weatherEmitter.stop();
+      this.weatherEmitter.destroy();
+      this.weatherEmitter = null;
+    }
+
+    if (this.sunSprite) {
+      this.sunSprite.destroy();
+      this.sunSprite = null;
+    }
+    if (this.sunRays) {
+      this.tweens.killTweensOf(this.sunRays);
+      this.sunRays.destroy();
+      this.sunRays = null;
+    }
+
+    // Clean up weather-specific timers to prevent accumulation
+    if (this.lightningTimer) {
+      this.lightningTimer.destroy();
+      this.lightningTimer = null;
+    }
+    if (this.apocalypseTimer) {
+      this.apocalypseTimer.destroy();
+      this.apocalypseTimer = null;
+    }
+
+    // Reset camera background color (apocalypse sets it to dark red)
+    this.cameras.main.setBackgroundColor(0x000000);
+
+    // Update cloud appearance
+    this.clouds.forEach((cloud) => {
+      let tint = 0xffffff;
+      let alpha = 0.5;
+
+      switch (weather) {
+        case "sunny":
+          tint = 0xffffff;
+          alpha = 0.3;
+          break;
+        case "cloudy":
+          tint = 0xaaaaaa;
+          alpha = 0.7;
+          break;
+        case "rain":
+          tint = 0x666666;
+          alpha = 0.85;
+          break;
+        case "storm":
+          tint = 0x444444;
+          alpha = 0.95;
+          break;
+        case "apocalypse":
+          tint = 0x442222;
+          alpha = 1;
+          break;
+      }
+
+      this.tweens.add({
+        targets: cloud,
+        alpha,
+        duration: 1000,
+      });
+      cloud.setTint(tint);
+    });
+
+    // Weather-specific effects
+    switch (weather) {
+      case "sunny":
+        this.createSunnyEffect();
+        break;
+      case "rain":
+        this.createRainEffect(false);
+        break;
+      case "storm":
+        this.createRainEffect(true);
+        this.createLightningEffect();
+        break;
+      case "apocalypse":
+        this.createApocalypseEffect();
+        break;
+    }
+  }
+
+  private createSunnyEffect(): void {
+    // Only show sun during daytime - check multiple conditions
+    if (this.currentTimeInfo?.isNight || this.currentTimeInfo?.isDusk) {
+      // At night or dusk, don't show sun - moon will be shown instead
+      return;
+    }
+
+    // Also destroy any existing sun to prevent duplicates
+    if (this.sunSprite) {
+      this.sunSprite.destroy();
+      this.sunSprite = null;
+    }
+
+    this.sunSprite = this.add.sprite(700, 70, "sun");
+    this.sunSprite.setScale(2.5);
+    this.sunSprite.setAlpha(0.9);
+    this.sunSprite.setDepth(0);
+
+    this.tweens.add({
+      targets: this.sunSprite,
+      scale: 2.7,
+      alpha: 0.7,
+      duration: 3000,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.easeInOut",
+    });
+
+    // Sun rays
+    this.sunRays = this.add.graphics();
+    this.sunRays.setDepth(-1);
+    this.sunRays.fillStyle(0xfbbf24, 0.1);
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2;
+      this.sunRays.fillTriangle(
+        700,
+        70,
+        700 + Math.cos(angle) * 150,
+        70 + Math.sin(angle) * 150,
+        700 + Math.cos(angle + 0.3) * 150,
+        70 + Math.sin(angle + 0.3) * 150
+      );
+    }
+
+    this.tweens.add({
+      targets: this.sunRays,
+      alpha: 0.5,
+      angle: 360,
+      duration: 30000,
+      repeat: -1,
+    });
+  }
+
+  private createRainEffect(isStorm: boolean): void {
+    this.weatherEmitter = this.add.particles(0, 0, "rain", {
+      x: { min: 0, max: GAME_WIDTH },
+      y: Math.round(-10 * SCALE),
+      lifespan: 800,
+      speedY: { min: Math.round(300 * SCALE), max: Math.round(500 * SCALE) },
+      speedX: isStorm
+        ? { min: Math.round(-100 * SCALE), max: Math.round(-150 * SCALE) }
+        : { min: Math.round(-20 * SCALE), max: Math.round(20 * SCALE) },
+      scale: { start: SCALE, end: 0.6 * SCALE },
+      quantity: isStorm ? 15 : 8,
+      frequency: 30,
+      alpha: { start: 0.8, end: 0.3 },
+    });
+    this.weatherEmitter.setDepth(50);
+  }
+
+  private createLightningEffect(): void {
+    // Use a single looping timer instead of recursive chain to prevent accumulation
+    // Random delay between strikes is achieved via the base delay + random skip logic
+    this.lightningTimer = this.time.addEvent({
+      delay: 2000,
+      callback: () => {
+        if (this.worldState?.weather !== "storm") return;
+        // Random chance each tick to create variation (avg ~4s between strikes)
+        if (Math.random() > 0.4) return;
+
+        // Flash
+        this.cameras.main.flash(100, 255, 255, 255, true);
+
+        // Lightning bolt (scaled)
+        const x = Math.round(100 * SCALE) + Math.random() * Math.round(600 * SCALE);
+        const lightning = this.add.sprite(x, Math.round(100 * SCALE), "lightning");
+        lightning.setScale(2 * SCALE);
+        lightning.setDepth(60);
+
+        this.tweens.add({
+          targets: lightning,
+          alpha: 0,
+          duration: 200,
+          onComplete: () => lightning.destroy(),
+        });
+      },
+      loop: true,
+    });
+  }
+
+  private createApocalypseEffect(): void {
+    this.cameras.main.setBackgroundColor(0x1a0505);
+    this.overlay.setFillStyle(0xff0000, 0.15);
+
+    // Shake periodically — stored so updateWeather can clean it up
+    this.apocalypseTimer = this.time.addEvent({
+      delay: 2000,
+      callback: () => {
+        if (this.worldState?.weather === "apocalypse") {
+          this.cameras.main.shake(500, 0.005);
+        }
+      },
+      loop: true,
+    });
+
+    // Falling embers (scaled)
+    this.weatherEmitter = this.add.particles(0, 0, "coin", {
+      x: { min: 0, max: GAME_WIDTH },
+      y: Math.round(-10 * SCALE),
+      lifespan: 3000,
+      speedY: { min: Math.round(50 * SCALE), max: Math.round(100 * SCALE) },
+      speedX: { min: Math.round(-30 * SCALE), max: Math.round(30 * SCALE) },
+      scale: { start: 0.3 * SCALE, end: 0 },
+      quantity: 2,
+      frequency: 200,
+      tint: 0xff4444,
+      alpha: { start: 0.8, end: 0 },
+    });
+    this.weatherEmitter.setDepth(50);
+  }
+
+  private updateCharacters(characters: GameCharacter[]): void {
+    // Performance: rebuild character lookup map for O(1) access in update()
+    this.characterById.clear();
+    characters.forEach((c) => this.characterById.set(c.id, c));
+
+    // Filter characters by current zone
+    // Characters with matching zone or no zone (undefined) appear in current zone
+    // Neo (isScout) and CJ go to Catalog (trending), others to Park (main_city)
+    const zoneCharacters = characters.filter((c) => {
+      if (!c.zone) return this.currentZone === "main_city"; // Default: Park
+      return c.zone === this.currentZone;
+    });
+
+    const zoneCharacterIds = new Set(zoneCharacters.map((c) => c.id));
+
+    // Show/hide sprites based on zone
+    this.characterSprites.forEach((sprite, id) => {
+      const shouldShow = zoneCharacterIds.has(id);
+      sprite.setVisible(shouldShow);
+
+      // Toggle mobile labels with sprite
+      const s = sprite as any;
+      if (s._mobileLabel) s._mobileLabel.setVisible(shouldShow);
+      if (s._mobileLabelBg) s._mobileLabelBg.setVisible(shouldShow);
+
+      // Toggle drop shadow with sprite
+      if (s._shadow) s._shadow.setVisible(shouldShow);
+
+      // Handle associated glow sprites (including Shaw and Academy characters)
+      GLOW_KEYS.forEach((key) => {
+        const glow = (sprite as any)[key];
+        if (glow) glow.setVisible(shouldShow);
+      });
+    });
+
+    const currentIds = new Set(characters.map((c) => c.id));
+
+    // Remove old characters and their associated glow sprites
+    this.characterSprites.forEach((sprite, id) => {
+      if (!currentIds.has(id)) {
+        // Clean up associated glow sprites before destroying (including Academy characters)
+        GLOW_KEYS.forEach((key) => {
+          const glow = (sprite as any)[key];
+          if (glow) {
+            this.tweens.killTweensOf(glow); // Stop any running tweens
+            glow.destroy();
+          }
+        });
+        // Clean up mobile labels before destroying sprite
+        const sd = sprite as any;
+        if (sd._mobileLabel) sd._mobileLabel.destroy();
+        if (sd._mobileLabelBg) sd._mobileLabelBg.destroy();
+        // Clean up visitor sparkle
+        if (sd._visitorSparkle) sd._visitorSparkle.destroy();
+        // Clean up drop shadow
+        if (sd._shadow) {
+          sd._shadow.destroy();
+          sd._shadow = null;
+        }
+        sprite.destroy();
+        this.characterSprites.delete(id);
+        this.characterVariants.delete(id);
+      }
+    });
+
+    // Separate characters into existing (quick update) and new (needs creation)
+    // Only create sprites for characters in the current zone
+    const existingCharacters: { character: GameCharacter; sprite: Phaser.GameObjects.Sprite }[] =
+      [];
+    const newCharacters: { character: GameCharacter; index: number }[] = [];
+
+    characters.forEach((character, index) => {
+      const sprite = this.characterSprites.get(character.id);
+      if (sprite) {
+        existingCharacters.push({ character, sprite });
+      } else {
+        // Only create new sprites for characters in the current zone
+        const charZone = character.zone || "main_city"; // Default to Park
+        if (charZone === this.currentZone) {
+          newCharacters.push({ character, index });
+        }
+      }
+    });
+
+    // Update existing characters immediately (fast path)
+    existingCharacters.forEach(({ character, sprite }) => {
+      this.updateExistingCharacter(character, sprite);
+    });
+
+    // Batch create new characters across frames to prevent frame drops
+    const BATCH_SIZE = 4; // Batch character creation across frames
+    const createBatch = (startIndex: number) => {
+      const endIndex = Math.min(startIndex + BATCH_SIZE, newCharacters.length);
+      for (let i = startIndex; i < endIndex; i++) {
+        this.createCharacterSprite(newCharacters[i].character, newCharacters[i].index);
+      }
+      // Schedule next batch if there are more characters
+      if (endIndex < newCharacters.length) {
+        this.time.delayedCall(0, () => createBatch(endIndex));
+      }
+    };
+
+    if (newCharacters.length > 0) {
+      createBatch(0);
+    }
+  }
+
+  private updateExistingCharacter(
+    character: GameCharacter,
+    sprite: Phaser.GameObjects.Sprite
+  ): void {
+    // Update special character glow positions if they exist (including Academy characters)
+    GLOW_KEYS.forEach((key) => {
+      const glow = (sprite as any)[key];
+      if (glow) {
+        glow.x = sprite.x;
+        glow.y = sprite.y;
+      }
+    });
+
+    // Sync mobile labels with current sprite position
+    if (this.isMobile) this.updateMobileLabel(sprite);
+
+    // External agents (OpenClaws) and spawned agents (ElizaOS) - don't change their texture
+    const isOpenClaw = character.id.startsWith("external-") || character.id.startsWith("agent-");
+
+    // Update texture based on mood (skip for special characters including Academy and OpenClaws)
+    const isToly = character.isToly === true;
+    const isAsh = character.isAsh === true;
+    const isFinn = character.isFinn === true;
+    const isDev = character.isDev === true;
+    const isScout = character.isScout === true;
+    const isCJ = character.isCJ === true;
+    const isShaw = character.isShaw === true;
+    // Academy characters
+    const isRamo = character.isRamo === true;
+    const isSincara = character.isSincara === true;
+    const isStuu = character.isStuu === true;
+    const isSam = character.isSam === true;
+    const isAlaa = character.isAlaa === true;
+    const isCarlo = character.isCarlo === true;
+    const isBNN = character.isBNN === true;
+    // Founder's Corner characters
+    const isProfessorOak = character.isProfessorOak === true;
+    // Mascots
+    const isCityBot = character.isCityBot === true;
+    const isAcademyChar = isRamo || isSincara || isStuu || isSam || isAlaa || isCarlo || isBNN;
+    const isFoundersChar = isProfessorOak;
+    const isMascot = isCityBot;
+    if (
+      !isToly &&
+      !isAsh &&
+      !isFinn &&
+      !isDev &&
+      !isScout &&
+      !isCJ &&
+      !isShaw &&
+      !isAcademyChar &&
+      !isFoundersChar &&
+      !isMascot &&
+      !isOpenClaw
+    ) {
+      const variant = this.characterVariants.get(character.id) ?? 0;
+      const expectedTexture = this.getCharacterTexture(character.mood, variant);
+      if (sprite.texture?.key !== expectedTexture) {
+        sprite.setTexture(expectedTexture);
+      }
+    }
+  }
+
+  private createCharacterSprite(character: GameCharacter, index: number): void {
+    // External agents (DB-registered) and spawned agents (ElizaOS) use crab/lobster sprites
+    const isExternalAgent = character.id.startsWith("external-");
+    const isSpawnedAgent = character.id.startsWith("agent-");
+    const isMoltbookAgent =
+      (isExternalAgent || isSpawnedAgent) && character.provider === "moltbook";
+    const isOpenClaw = isExternalAgent || isSpawnedAgent;
+
+    // Special characters use unique textures, others get random variants
+    const isToly = character.isToly === true;
+    const isAsh = character.isAsh === true;
+    const isFinn = character.isFinn === true;
+    const isDev = character.isDev === true;
+    const isScout = character.isScout === true;
+    const isCJ = character.isCJ === true;
+    const isShaw = character.isShaw === true;
+    // Academy characters
+    const isRamo = character.isRamo === true;
+    const isSincara = character.isSincara === true;
+    const isStuu = character.isStuu === true;
+    const isSam = character.isSam === true;
+    const isAlaa = character.isAlaa === true;
+    const isCarlo = character.isCarlo === true;
+    const isBNN = character.isBNN === true;
+    // Founder's Corner characters
+    const isProfessorOak = character.isProfessorOak === true;
+    // Mascots
+    const isCityBot = character.isCityBot === true;
+    // Platform visitors
+    const isVisitor = character.isVisitor === true;
+    const isAcademyChar = isRamo || isSincara || isStuu || isSam || isAlaa || isCarlo || isBNN;
+    const isFoundersChar = isProfessorOak;
+    const isMascot = isCityBot;
+    const isSpecial =
+      isToly ||
+      isAsh ||
+      isFinn ||
+      isDev ||
+      isScout ||
+      isCJ ||
+      isShaw ||
+      isAcademyChar ||
+      isFoundersChar ||
+      isMascot ||
+      isOpenClaw;
+    const variant = index % 9;
+    this.characterVariants.set(character.id, variant);
+
+    const textureKey = isOpenClaw
+      ? isMoltbookAgent
+        ? "agent_lobster"
+        : "agent_crab"
+      : isToly
+        ? "toly"
+        : isAsh
+          ? "ash"
+          : isFinn
+            ? "finn"
+            : isDev
+              ? "dev"
+              : isScout
+                ? "neo"
+                : isCJ
+                  ? "cj"
+                  : isShaw
+                    ? "shaw"
+                    : isRamo
+                      ? "ramo"
+                      : isSincara
+                        ? "sincara"
+                        : isStuu
+                          ? "stuu"
+                          : isSam
+                            ? "sam"
+                            : isAlaa
+                              ? "alaa"
+                              : isCarlo
+                                ? "carlo"
+                                : isBNN
+                                  ? "bnn"
+                                  : isProfessorOak
+                                    ? "professorOak"
+                                    : isCityBot
+                                      ? "citybot"
+                                      : this.getCharacterTexture(character.mood, variant);
+    const sprite = this.add.sprite(character.x, character.y, textureKey);
+    sprite.setDepth(isSpecial ? 11 : 10); // Special characters slightly above others
+    if (this.isMobile) {
+      sprite.setInteractive(
+        new Phaser.Geom.Rectangle(-40, -40, 80, 80),
+        Phaser.Geom.Rectangle.Contains
+      );
+    } else {
+      sprite.setInteractive();
+    }
+    (sprite as any)._characterId = character.id;
+    sprite.setScale(isSpecial ? 1.3 : 1.2); // Special characters slightly larger
+
+    // Drop shadow under NPC feet — keeps them grounded and adds depth.
+    // Special characters get a slightly wider shadow to match their larger scale.
+    this.attachShadow(sprite, isSpecial ? 0.95 : 0.85);
+
+    // Visitor sparkle indicator
+    if (isVisitor) {
+      const sparkle = this.add.text(character.x, character.y - 22, "✦", {
+        fontFamily: "monospace",
+        fontSize: "8px",
+        color: "#fbbf24",
+      });
+      sparkle.setOrigin(0.5, 0.5);
+      sparkle.setDepth(12);
+      (sprite as any)._visitorSparkle = sparkle;
+    }
+
+    // Persistent name label on mobile (always visible, no hover needed)
+    // Max 3 labels on small screens; skip if it would overlap an existing label
+    const maxLabels = this.scale.width >= 600 ? 6 : 3;
+    if (this.isMobile && index < maxLabels) {
+      const charName = character.username || character.id;
+      const displayName = charName.length > 8 ? charName.substring(0, 8) : charName;
+      const smallScreen = this.scale.width < 430;
+      const labelFontSize = smallScreen ? "7px" : "8px";
+      const charWidth = smallScreen ? 5 : 5.5;
+      const labelW = displayName.length * charWidth + 6;
+      const labelH = 12;
+      // Stagger labels: even indices below, odd indices above to reduce overlap
+      const labelYOffset = index % 2 === 0 ? 18 : -20;
+      const lx = character.x;
+      const ly = character.y + labelYOffset;
+
+      // Check collision with already-placed labels
+      let collides = false;
+      this.characterSprites.forEach((otherSprite) => {
+        const otherBg = (otherSprite as any)._mobileLabelBg as
+          | Phaser.GameObjects.Rectangle
+          | undefined;
+        if (!otherBg || !otherBg.active) return;
+        const dx = Math.abs(lx - otherBg.x);
+        const dy = Math.abs(ly - otherBg.y);
+        if (dx < labelW / 2 + otherBg.width / 2 + 4 && dy < labelH) {
+          collides = true;
+        }
+      });
+
+      if (!collides) {
+        const labelBg = this.add.rectangle(lx, ly, labelW, labelH, 0x000000, 0.75);
+        labelBg.setDepth(12);
+        const nameLabel = this.add.text(lx, ly, displayName.toUpperCase(), {
+          fontFamily: "monospace",
+          fontSize: labelFontSize,
+          color: "#ffffff",
+        });
+        nameLabel.setOrigin(0.5, 0.5);
+        nameLabel.setDepth(13);
+        (sprite as any)._mobileLabel = nameLabel;
+        (sprite as any)._mobileLabelBg = labelBg;
+        (sprite as any)._mobileLabelOffset = labelYOffset;
+      }
+    }
+
+    // Hover effects
+    sprite.on("pointerover", () => {
+      sprite?.setScale(isSpecial ? 1.5 : 1.4);
+      if (isOpenClaw) {
+        // External agents (Openclaws) show their Moltbook profile tooltip
+        this.showOpenClawTooltip(character, sprite!, isMoltbookAgent);
+      } else if (isToly) {
+        this.showTolyTooltip(sprite!);
+      } else if (isAsh) {
+        this.showAshTooltip(sprite!);
+      } else if (isFinn) {
+        this.showFinnTooltip(sprite!);
+      } else if (isDev) {
+        this.showDevTooltip(sprite!);
+      } else if (isScout) {
+        this.showScoutTooltip(sprite!);
+      } else if (isCJ) {
+        this.showCJTooltip(sprite!);
+      } else if (isShaw) {
+        this.showShawTooltip(sprite!);
+      } else if (isRamo) {
+        this.showRamoTooltip(sprite!);
+      } else if (isSincara) {
+        this.showSincaraTooltip(sprite!);
+      } else if (isStuu) {
+        this.showStuuTooltip(sprite!);
+      } else if (isSam) {
+        this.showSamTooltip(sprite!);
+      } else if (isAlaa) {
+        this.showAlaaTooltip(sprite!);
+      } else if (isCarlo) {
+        this.showCarloTooltip(sprite!);
+      } else if (isBNN) {
+        this.showBNNTooltip(sprite!);
+      } else if (isProfessorOak) {
+        this.showProfessorOakTooltip(sprite!);
+      } else if (isCityBot) {
+        this.showCityBotTooltip(sprite!);
+      } else if (isVisitor) {
+        this.showVisitorTooltip(character, sprite!);
+      } else {
+        this.showCharacterTooltip(character, sprite!);
+      }
+      this.input.setDefaultCursor("pointer");
+    });
+    sprite.on("pointerout", () => {
+      sprite?.setScale(isSpecial ? 1.3 : 1.2);
+      // Delay tooltip hide so "Visit Profile" button can be clicked
+      this.scheduleHideTooltip();
+      this.input.setDefaultCursor("default");
+    });
+    sprite.on("pointerup", () => {
+      if (this.wasDragGesture) return;
+      // On mobile, skip if player is too far — tap-to-move walks there
+      if (this.isMobile && this.playerEnabled && this.localPlayer) {
+        const dist = Math.abs(this.localPlayer.x - sprite.x);
+        if (dist > 150) return;
+      }
+
+      if (isOpenClaw) {
+        // Show tooltip with "Visit Profile" button instead of navigating directly
+        this.showCharacterTooltip(character, sprite!);
+      } else if (isToly) {
+        // Toly opens the Solana wisdom chat
+        window.dispatchEvent(new CustomEvent("agencity-toly-click"));
+      } else if (isAsh) {
+        // Ash opens the ecosystem guide chat
+        window.dispatchEvent(new CustomEvent("agencity-ash-click"));
+      } else if (isFinn) {
+        // Finn opens the AgenC guide chat
+        window.dispatchEvent(new CustomEvent("agencity-finn-click"));
+      } else if (isDev) {
+        // The Dev opens the trading agent chat
+        window.dispatchEvent(new CustomEvent("agencity-dev-click"));
+      } else if (isScout) {
+        // Neo opens the scout panel
+        window.dispatchEvent(new CustomEvent("agencity-scout-click"));
+      } else if (isCJ) {
+        // CJ opens the hood rat chat
+        window.dispatchEvent(new CustomEvent("agencity-cj-click"));
+      } else if (isShaw) {
+        // Shaw opens the ElizaOS creator chat
+        window.dispatchEvent(new CustomEvent("agencity-shaw-click"));
+      } else if (isRamo) {
+        // Ramo opens the CTO chat
+        window.dispatchEvent(new CustomEvent("agencity-ramo-click"));
+      } else if (isSincara) {
+        // Sincara opens the frontend engineer chat
+        window.dispatchEvent(new CustomEvent("agencity-sincara-click"));
+      } else if (isStuu) {
+        // Stuu opens the operations chat
+        window.dispatchEvent(new CustomEvent("agencity-stuu-click"));
+      } else if (isSam) {
+        // Sam opens the growth chat
+        window.dispatchEvent(new CustomEvent("agencity-sam-click"));
+      } else if (isAlaa) {
+        // Alaa opens the skunk works chat
+        window.dispatchEvent(new CustomEvent("agencity-alaa-click"));
+      } else if (isCarlo) {
+        // Carlo opens the community chat
+        window.dispatchEvent(new CustomEvent("agencity-carlo-click"));
+      } else if (isBNN) {
+        // BNN opens the news network chat
+        window.dispatchEvent(new CustomEvent("agencity-bnn-click"));
+      } else if (isProfessorOak) {
+        // Professor Oak opens the token launch guide chat
+        window.dispatchEvent(new CustomEvent("agencity-professoroak-click"));
+      } else if (isCityBot) {
+        // CityBot opens the mascot chat
+        window.dispatchEvent(new CustomEvent("agencity-citybot-click"));
+      } else if (character.profileUrl) {
+        // Show tooltip with "Visit Profile" button instead of navigating directly
+        this.showCharacterTooltip(character, sprite!);
+      }
+    });
+
+    // Walking animation - characters randomly walk around the park
+    this.startCharacterWalking(sprite, character, isSpecial);
+
+    // Add glow effects for special characters (configuration-driven)
+    const glowConfigs: Array<{
+      active: boolean;
+      key: string;
+      tint: number;
+      alpha?: number;
+      targetAlpha?: number;
+      scale?: number;
+      duration?: number;
+    }> = [
+      { active: isToly, key: "tolyGlow", tint: 0x9945ff },
+      { active: isAsh, key: "ashGlow", tint: 0xdc2626 },
+      { active: isFinn, key: "finnGlow", tint: 0x10b981 },
+      { active: isDev, key: "devGlow", tint: 0x8b5cf6 },
+      {
+        active: isScout,
+        key: "scoutGlow",
+        tint: 0x00ff41,
+        alpha: 0.4,
+        targetAlpha: 0.7,
+        scale: 1.3,
+        duration: 800,
+      },
+      { active: isCJ, key: "cjGlow", tint: 0xf97316, duration: 1200 },
+      { active: isShaw, key: "shawGlow", tint: 0xff5800, duration: 1000 },
+      // Academy character glows
+      { active: isRamo, key: "ramoGlow", tint: 0x3b82f6, duration: 1100 }, // Blue - technical
+      { active: isSincara, key: "sincaraGlow", tint: 0xec4899, duration: 1300 }, // Pink - creative
+      { active: isStuu, key: "stuuGlow", tint: 0x22c55e, duration: 1000 }, // Green - support
+      { active: isSam, key: "samGlow", tint: 0xfbbf24, duration: 900 }, // Yellow - marketing energy
+      {
+        active: isAlaa,
+        key: "alaaGlow",
+        tint: 0x6366f1,
+        alpha: 0.5,
+        targetAlpha: 0.8,
+        duration: 700,
+      }, // Indigo - mysterious
+      { active: isCarlo, key: "carloGlow", tint: 0xf97316, duration: 1100 }, // Orange - community warmth
+      { active: isBNN, key: "bnnGlow", tint: 0x06b6d4, duration: 800 }, // Cyan - news/info
+      // Founder's Corner character glows
+      { active: isProfessorOak, key: "professorOakGlow", tint: 0xfbbf24, duration: 1000 }, // Amber - wisdom
+      // Mascot glows
+      { active: isCityBot, key: "citybotGlow", tint: 0x00ff00, duration: 900 }, // Bright green - money bag energy
+      // External agent (OpenClaw) glows - lobsters are red, crabs are orange
+      {
+        active: isOpenClaw,
+        key: "openClawGlow",
+        tint: isMoltbookAgent ? 0xff4444 : 0xffa500,
+        alpha: 0.4,
+        targetAlpha: 0.7,
+        scale: 1.25,
+        duration: 1000,
+      },
+    ];
+
+    for (const cfg of glowConfigs) {
+      if (!cfg.active) continue;
+      const glow = this.add.sprite(character.x, character.y, "glow");
+      glow.setScale(1.0);
+      glow.setAlpha(cfg.alpha ?? 0.3);
+      glow.setTint(cfg.tint);
+      glow.setDepth(10);
+      (sprite as any)[cfg.key] = glow;
+      this.tweens.add({
+        targets: glow,
+        alpha: cfg.targetAlpha ?? 0.5,
+        scale: cfg.scale ?? 1.2,
+        duration: cfg.duration ?? 1500,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Store character type flags on sprite for speech bubble system
+    Object.assign(sprite, {
+      isToly,
+      isAsh,
+      isFinn,
+      isDev,
+      isScout,
+      isCJ,
+      isShaw,
+      isRamo,
+      isSincara,
+      isStuu,
+      isSam,
+      isAlaa,
+      isCarlo,
+      isBNN,
+      isProfessorOak,
+      isCityBot,
+      isOpenClaw,
+      isMoltbookAgent,
+    });
+
+    // Register external agents (crabs/lobsters) for wandering behavior on MoltBeach
+    if (isOpenClaw && character.zone === "moltbook") {
+      // Check if already registered
+      const existingCrab = this.beachCrabs.find((c) => c.characterId === character.id);
+      if (!existingCrab) {
+        this.beachCrabs.push({
+          characterId: character.id,
+          sprite: sprite,
+          targetX: character.x + (Math.random() - 0.5) * Math.round(200 * SCALE),
+          speed: 0.3 + Math.random() * 0.2, // Slower than animals - crabs are chill
+          direction: Math.random() > 0.5 ? "left" : "right",
+          idleTimer: Math.floor(Math.random() * 100), // Start at random idle state
+          isIdle: Math.random() > 0.5, // Some start idle, some start moving
+          baseY: character.y,
+          isLobster: isMoltbookAgent,
+        });
+      }
+    }
+
+    this.characterSprites.set(character.id, sprite);
+  }
+
+  private getCharacterTexture(mood: GameCharacter["mood"], variant: number): string {
+    const moodSuffix = mood === "neutral" ? "" : `_${mood}`;
+    return `character_${variant}${moodSuffix}`;
+  }
+
+  private updateBuildings(buildings: GameBuilding[]): void {
+    // Rebuild O(1) lookup map for proximity checks
+    this.buildingById.clear();
+    for (const b of buildings) {
+      this.buildingById.set(b.id, b);
+    }
+
+    // First, hide all buildings
+    this.buildingSprites.forEach((container) => {
+      container.setVisible(false);
+    });
+
+    // Filter buildings by current zone
+    // Buildings with no zone appear in most zones, but NOT in arena/ascension (special zones)
+    // Exception: platform buildings with an explicit zone assignment always render in their zone
+    const zoneBuildings = buildings.filter((b) => {
+      // Ascension zone handles its own platform showcase — don't create duplicate sprites
+      if (b.isPlatform && b.zone === "ascension") return false;
+      // Platform buildings render in their assigned zone
+      if (b.isPlatform && b.zone) return b.zone === this.currentZone;
+      // Arena and Ascension zones have no regular token buildings
+      if (this.currentZone === "arena" || this.currentZone === "ascension") return false;
+      if (!b.zone) return true; // No zone = appears in all non-special zones
+      return b.zone === this.currentZone;
+    });
+
+    const allBuildingIds = new Set(buildings.map((b) => b.id));
+
+    // Only destroy buildings that no longer exist in the world state
+    this.buildingSprites.forEach((container, id) => {
+      if (!allBuildingIds.has(id)) {
+        container.destroy();
+        this.buildingSprites.delete(id);
+        this.buildingInitialized.delete(id);
+      }
+    });
+
+    // Separate buildings into existing (quick update) and new (needs creation)
+    const existingBuildings: GameBuilding[] = [];
+    const newBuildings: GameBuilding[] = [];
+
+    zoneBuildings.forEach((building) => {
+      if (this.buildingSprites.has(building.id)) {
+        existingBuildings.push(building);
+      } else {
+        newBuildings.push(building);
+      }
+    });
+
+    // Update existing buildings immediately (fast path)
+    existingBuildings.forEach((building) => {
+      this.updateExistingBuilding(building);
+    });
+
+    // Batch create new buildings across frames to prevent frame drops
+    const BATCH_SIZE = 3;
+    const createBatch = (startIndex: number) => {
+      const endIndex = Math.min(startIndex + BATCH_SIZE, newBuildings.length);
+      for (let i = startIndex; i < endIndex; i++) {
+        this.createBuildingSprite(newBuildings[i]);
+      }
+      // Schedule next batch if there are more buildings
+      if (endIndex < newBuildings.length) {
+        this.time.delayedCall(0, () => createBatch(endIndex));
+      }
+    };
+
+    if (newBuildings.length > 0) {
+      createBatch(0);
+    }
+
+    // Update ascension showcase labels with platform token data
+    const ascensionPlatform = buildings.filter((b) => b.isPlatform && b.zone === "ascension");
+    ascensionPlatform.forEach((b, i) => {
+      const label = (this as unknown as Record<string, unknown>)[
+        `_platformLabel_ascension_showcase_${i}`
+      ];
+      if (label && (label as Phaser.GameObjects.Text).active) {
+        (label as Phaser.GameObjects.Text).setText(`$${b.symbol}`);
+      }
+    });
+  }
+
+  // Get building decay status from health value
+  private getStatusFromHealth(health: number): BuildingStatus {
+    const thresholds = ECOSYSTEM_CONFIG.buildings.decay.thresholds;
+    if (health <= thresholds.dormant) return "dormant";
+    if (health <= thresholds.critical) return "critical";
+    if (health <= thresholds.warning) return "warning";
+    return "active";
+  }
+
+  // Apply visual decay effects to a building sprite
+  private applyDecayVisuals(
+    building: GameBuilding,
+    sprite: Phaser.GameObjects.Sprite,
+    container: Phaser.GameObjects.Container
+  ): void {
+    // Skip floating buildings - they never decay
+    // Agent beach buildings are isPermanent but DO show activity-based decay
+    if (building.isFloating) return;
+    if (building.isPermanent && !building.isBeachTheme) return;
+
+    const status = building.status || this.getStatusFromHealth(building.health);
+
+    // Clear existing decay effects
+    sprite.clearTint();
+    sprite.setAlpha(1);
+
+    // Remove any existing decay tweens on this sprite
+    this.tweens.killTweensOf(sprite);
+
+    // Remove existing dormant indicator if any
+    const existingZzz = container.getByName("dormantIndicator");
+    if (existingZzz) {
+      this.tweens.killTweensOf(existingZzz);
+      existingZzz.destroy();
+    }
+
+    switch (status) {
+      case "warning":
+        sprite.setTint(0xffcc00); // Yellow tint
+        sprite.setAlpha(0.9);
+        break;
+
+      case "critical":
+        sprite.setTint(0xff6600); // Orange tint
+        sprite.setAlpha(0.75);
+        // Add pulsing effect for urgency
+        this.tweens.add({
+          targets: sprite,
+          alpha: 0.6,
+          duration: 1000,
+          yoyo: true,
+          repeat: -1,
+        });
+        break;
+
+      case "dormant":
+        sprite.setTint(0x666666); // Gray tint
+        sprite.setAlpha(0.5);
+        // Add sleeping indicator
+        this.addDormantIndicator(container);
+        break;
+
+      default:
+        // "active" - no special effects
+        break;
+    }
+  }
+
+  // Add a floating "ZZZ" indicator for dormant buildings
+  private addDormantIndicator(container: Phaser.GameObjects.Container): void {
+    const zzz = this.add.text(20, -60, "zzZ", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#9ca3af",
+    });
+    zzz.setName("dormantIndicator");
+
+    // Float animation
+    this.tweens.add({
+      targets: zzz,
+      y: zzz.y - 10,
+      alpha: { from: 1, to: 0.5 },
+      duration: 1500,
+      yoyo: true,
+      repeat: -1,
+    });
+
+    container.add(zzz);
+  }
+
+  private updateExistingBuilding(building: GameBuilding): void {
+    const container = this.buildingSprites.get(building.id);
+    if (!container) return;
+
+    // Show the existing building
+    container.setVisible(true);
+
+    // Special buildings have fixed textures - no need to update
+    const isPokeCenter = building.id.includes("PokeCenter") || building.symbol === "HEAL";
+    const isCasino = building.id.includes("Casino") || building.symbol === "CASINO";
+    const isArcade = building.id.includes("Arcade") || building.symbol === "ARCADE";
+    const isBagsHQ = building.isFloating || building.symbol === "AGENCITY";
+    const isTreasury = building.id.startsWith("Treasury");
+    const isMansion = building.isMansion;
+
+    // Beach-themed agent buildings (Moltbook Beach zone)
+    const isBeachBuilding = building.isBeachTheme || building.zone === "moltbook";
+    // Agent buildings have fixed textures keyed by zone — skip texture swap
+    const isAgentBuilding = building.id.startsWith("agent-building-");
+
+    // Skip texture updates for special buildings (they don't change)
+    if (isPokeCenter || isCasino || isArcade || isBagsHQ || isTreasury || isMansion) {
+      return;
+    }
+
+    // Platform buildings use zone-specific showcase textures — skip generic texture swap
+    if (building.isPlatform) {
+      this.applyDecayVisuals(building, container.getAt(1) as Phaser.GameObjects.Sprite, container);
+      return;
+    }
+
+    // Agent buildings: update decay visuals and check for level/texture changes (admin override)
+    if (isAgentBuilding) {
+      const agentSprite = container.getAt(1) as Phaser.GameObjects.Sprite;
+      if (agentSprite) {
+        this.applyDecayVisuals(building, agentSprite, container);
+        // Check if level changed (e.g. admin override) and update texture accordingly
+        const agentLevel = Math.min(Math.max(building.level, 1), 5);
+        const expectedTexture = isBeachBuilding
+          ? `beach_building_${agentLevel}`
+          : `building_${agentLevel}_0`;
+        if (agentSprite.texture?.key !== expectedTexture) {
+          this.tweens.add({
+            targets: container,
+            scale: 1.15,
+            duration: 150,
+            yoyo: true,
+            onComplete: () => {
+              agentSprite.setTexture(expectedTexture);
+            },
+          });
+        }
+      }
+      return;
+    }
+
+    // Regular buildings: sprite is at index 1 (after shadow at index 0)
+    const sprite = container.getAt(1) as Phaser.GameObjects.Sprite;
+    if (!sprite) return;
+
+    // Apply decay visuals
+    this.applyDecayVisuals(building, sprite, container);
+
+    // Use same hash function to get consistent style
+    const getBuildingStyleUpdate = (id: string): number => {
+      let hash = 0;
+      for (let i = 0; i < id.length; i++) {
+        hash = (hash << 5) - hash + id.charCodeAt(i);
+        hash = hash & hash;
+      }
+      return Math.abs(hash) % 4;
+    };
+    const updateStyleIndex = getBuildingStyleUpdate(building.id);
+    // Beach buildings use their own texture set
+    const beachBuildingLevel = Math.min(Math.max(building.level, 1), 5);
+    const newTexture = isBeachBuilding
+      ? `beach_building_${beachBuildingLevel}`
+      : `building_${building.level}_${updateStyleIndex}`;
+    if (sprite.texture?.key !== newTexture) {
+      this.tweens.add({
+        targets: container,
+        scale: 1.15,
+        duration: 150,
+        yoyo: true,
+        onComplete: () => {
+          sprite.setTexture(newTexture);
+        },
+      });
+    }
+  }
+
+  private createBuildingSprite(building: GameBuilding): void {
+    if (this.buildingSprites.has(building.id)) return; // Already exists
+
+    const isFirstTimeCreation = !this.buildingInitialized.has(building.id);
+    const container = this.add.container(building.x, building.y);
+
+    // Scale building based on level (market cap)
+    // Level 1: 0.8x, Level 2: 0.9x, Level 3: 1.0x, Level 4: 1.15x, Level 5: 1.3x
+    const buildingScales = [0.8, 0.9, 1.0, 1.15, 1.3];
+    const buildingScale = buildingScales[building.level - 1] || 1.0;
+
+    // Shadow scales with building (floating HQ has no direct shadow)
+    const isBagsHQ = building.isFloating || building.symbol === "AGENCITY";
+    if (!isBagsHQ) {
+      const shadowWidth = 20 + building.level * 6;
+      const shadow = this.add.ellipse(2, 2, shadowWidth, 8, 0x000000, 0.3);
+      container.add(shadow);
+    }
+
+    // Use special texture for PokeCenter/Casino/HQ/Mansions, otherwise use level-based building with style
+    const isPokeCenter = building.id.includes("PokeCenter") || building.symbol === "HEAL";
+    const isCasino = building.id.includes("Casino") || building.symbol === "CASINO";
+    const isArcade = building.id.includes("Arcade") || building.symbol === "ARCADE";
+    const isTreasury = building.id.startsWith("Treasury");
+    const isAgenCityHQ = building.isFloating || building.symbol === "AGENCITY";
+    const isMansion = building.isMansion;
+
+    // Determine building style from mint address (deterministic - same token always gets same style)
+    // Each level has 4 styles (0-3)
+    const getBuildingStyle = (id: string): number => {
+      // Use a simple hash of the building id to get a style index 0-3
+      let hash = 0;
+      for (let i = 0; i < id.length; i++) {
+        hash = (hash << 5) - hash + id.charCodeAt(i);
+        hash = hash & hash; // Convert to 32-bit integer
+      }
+      return Math.abs(hash) % 4;
+    };
+
+    // For mansions, use holderRank to determine style (0-4)
+    const mansionStyleIndex = isMansion ? Math.min((building.holderRank || 1) - 1, 4) : 0;
+
+    const styleIndex = getBuildingStyle(building.id);
+    // Beach-themed buildings for Moltbook Beach zone
+    const isBeachBuilding = building.isBeachTheme || building.zone === "moltbook";
+    const beachBuildingLevel = Math.min(Math.max(building.level, 1), 5); // Clamp to 1-5
+
+    // Platform buildings use zone-specific showcase textures or themed textures
+    const getPlatformShowcaseTexture = (
+      zone: string | undefined,
+      rank: number | undefined,
+      theme: string | undefined
+    ): string | null => {
+      switch (zone) {
+        case "ascension": {
+          // Ranks 1-4: temple, observatory, vault, shrine
+          const ascTextures = [
+            "ascension_temple",
+            "ascension_observatory",
+            "ascension_vault",
+            "ascension_token_shrine",
+          ];
+          const ascSlot = (rank || 1) - 1; // rank 1→0, rank 2→1, etc.
+          return ascTextures[ascSlot] || ascTextures[0];
+        }
+        case "trending": {
+          const trendSlot = ((rank || 5) - 5) % 3; // ranks 5-7 → 0,1,2
+          return ["city_showcase_1", "city_showcase_2", "city_showcase_3"][trendSlot];
+        }
+        case "main_city": {
+          // Park: nature-themed — greenhouse, garden pavilion, treehouse
+          const parkSlot = ((rank || 8) - 8) % 3; // ranks 8-10 → 0,1,2
+          return ["park_showcase_1", "park_showcase_2", "park_showcase_3"][parkSlot];
+        }
+        case "moltbook": {
+          // Moltbook Beach: volcanic/tiki — volcanos fit the tropical island theme
+          const beachSlot = ((rank || 14) - 14) % 2; // ranks 14-15 → 0,1
+          return ["beach_showcase_1", "beach_showcase_2"][beachSlot];
+        }
+        default: {
+          // Use themed platform textures for non-showcase zones (labs)
+          // Override volcano to crystal only in labs (peaceful HQ zone)
+          const safeTheme = theme === "volcano" && zone === "labs" ? "crystal" : theme;
+          if (safeTheme && this.textures.exists(`platform_${safeTheme}`)) {
+            return `platform_${safeTheme}`;
+          }
+          return null;
+        }
+      }
+    };
+
+    const platformTexture = building.isPlatform
+      ? getPlatformShowcaseTexture(building.zone, building.platformRank, building.platformTheme)
+      : null;
+
+    const buildingTexture = platformTexture
+      ? platformTexture
+      : isAgenCityHQ
+        ? "bagshq"
+        : isMansion
+          ? `mansion_${mansionStyleIndex}`
+          : isPokeCenter
+            ? "pokecenter"
+            : isCasino
+              ? "casino"
+              : isArcade
+                ? "arcade_building"
+                : isTreasury
+                  ? "treasury"
+                  : isBeachBuilding
+                    ? `beach_building_${beachBuildingLevel}`
+                    : `building_${building.level}_${styleIndex}`;
+    const sprite = this.add.sprite(0, 0, buildingTexture);
+    sprite.setOrigin(0.5, 1);
+    // HQ is larger and floating, mansions use rank-based scaling from building data
+    const hqScale = 1.5;
+    // Mansions use mansionScale from world-calculator (1.5 for #1, 1.3 for #2-3, 1.15 for #4-5)
+    const mansionScale = building.mansionScale || 1.2;
+    sprite.setScale(
+      isAgenCityHQ
+        ? hqScale
+        : isMansion
+          ? mansionScale
+          : isPokeCenter
+            ? 1.0
+            : isCasino
+              ? 1.0
+              : isArcade
+                ? 1.0
+                : isTreasury
+                  ? 1.0
+                  : building.platformScale
+                    ? building.platformScale
+                    : buildingScale
+    );
+    container.add(sprite);
+
+    // Apply decay visuals for non-permanent buildings
+    if (!building.isPermanent && !building.isFloating) {
+      this.applyDecayVisuals(building, sprite, container);
+    }
+
+    // Add floating animation for HQ
+    if (isAgenCityHQ) {
+      this.tweens.add({
+        targets: container,
+        y: building.y - 10,
+        duration: 2000,
+        ease: "Sine.easeInOut",
+        yoyo: true,
+        repeat: -1,
+      });
+
+      // Add subtle gold glow around HQ
+      const hqGlow = this.add.sprite(0, -60, "glow");
+      hqGlow.setScale(1.2);
+      hqGlow.setAlpha(0.15);
+      hqGlow.setTint(0xffd700); // Gold glow
+      container.add(hqGlow);
+
+      this.tweens.add({
+        targets: hqGlow,
+        alpha: 0.25,
+        scale: 1.4,
+        duration: 2000,
+        ease: "Sine.easeInOut",
+        yoyo: true,
+        repeat: -1,
+      });
+    }
+
+    // Add gold glow, rank badge, and holder info for Mansions (Ballers Valley)
+    if (isMansion) {
+      const isWhale = building.holderRank === 1;
+      const glowScale = isWhale ? 1.8 : 1.4;
+      const glowAlpha = isWhale ? 0.3 : 0.2;
+      const glowY = isWhale ? -100 : -80;
+
+      // Gold glow effect (larger and brighter for #1 WHALE)
+      const mansionGlow = this.add.sprite(0, glowY, "glow");
+      mansionGlow.setScale(glowScale);
+      mansionGlow.setAlpha(glowAlpha);
+      mansionGlow.setTint(0xfbbf24); // Gold
+      container.addAt(mansionGlow, 0); // Add behind sprite
+
+      // Pulsing glow animation (more dramatic for #1)
+      this.tweens.add({
+        targets: mansionGlow,
+        alpha: isWhale ? 0.5 : 0.35,
+        scale: glowScale + (isWhale ? 0.4 : 0.2),
+        duration: isWhale ? 2000 : 2500,
+        ease: "Sine.easeInOut",
+        yoyo: true,
+        repeat: -1,
+      });
+
+      // #1 WHALE gets a secondary sparkle glow
+      if (isWhale) {
+        const sparkleGlow = this.add.sprite(0, glowY + 20, "glow");
+        sparkleGlow.setScale(1.0);
+        sparkleGlow.setAlpha(0.15);
+        sparkleGlow.setTint(0xfcd34d); // Brighter gold/amber
+        container.addAt(sparkleGlow, 0);
+
+        this.tweens.add({
+          targets: sparkleGlow,
+          alpha: 0.3,
+          scale: 1.3,
+          duration: 1500,
+          ease: "Sine.easeInOut",
+          yoyo: true,
+          repeat: -1,
+          delay: 500, // Offset for layered effect
+        });
+      }
+
+      // Make mansion interactive (clickable cursor)
+      sprite.setInteractive({ useHandCursor: true });
+    }
+
+    // Glow effect for pumping buildings (skip for HQ - it has its own gold glow)
+    if (building.glowing && !isAgenCityHQ) {
+      const glow = this.add.sprite(0, -40, "glow");
+      glow.setScale(1.5);
+      glow.setAlpha(0.4);
+      glow.setTint(0x4ade80);
+      container.add(glow);
+
+      this.tweens.add({
+        targets: glow,
+        alpha: 0.7,
+        scale: 1.8,
+        duration: 800,
+        yoyo: true,
+        repeat: -1,
+      });
+    }
+
+    // Label with background - HQ and Mansions get gold styling
+    const isHQBuilding = building.isFloating || building.symbol === "AGENCITY";
+    const isMansionLandmark = building.isMansion && building.isPermanent;
+    const isGoldLabel = isHQBuilding || isMansionLandmark;
+
+    // Determine label text: HQ shows "$AgenCity", mansions show their landmark name, others show symbol
+    const labelText = isHQBuilding
+      ? "$AgenCity"
+      : isMansionLandmark
+        ? building.name
+        : building.symbol;
+    const labelWidth = isHQBuilding ? 85 : isMansionLandmark ? 95 : 50;
+
+    const labelBg = this.add.rectangle(
+      0,
+      isGoldLabel ? 20 : 12,
+      labelWidth,
+      isGoldLabel ? 16 : 14,
+      0x000000,
+      0.8
+    );
+    labelBg.setStrokeStyle(isGoldLabel ? 2 : 1, isGoldLabel ? 0xffd700 : 0x4ade80);
+    container.add(labelBg);
+    const label = this.add.text(0, isGoldLabel ? 20 : 12, labelText, {
+      fontFamily: "monospace",
+      fontSize: isGoldLabel ? "11px" : "9px",
+      color: isGoldLabel ? "#ffd700" : "#4ade80",
+    });
+    label.setOrigin(0.5, 0.5);
+    container.add(label);
+
+    // Platform buildings get an AgenC badge below the label
+    if (building.isPlatform) {
+      const badge = this.add
+        .text(0, (isGoldLabel ? 20 : 12) + 10, "AgenC", {
+          fontSize: "8px",
+          fontFamily: "monospace",
+          color: "#a78bfa",
+        })
+        .setOrigin(0.5, 0)
+        .setDepth(6);
+      container.add(badge);
+    }
+
+    // Buildings render behind characters (depth 10-11) but in front of ground elements
+    // Buildings on the right appear behind buildings on the left when overlapping
+    // HQ floats in sky so it's always visible above other buildings
+    const buildingDepth = isHQBuilding ? 8 : 5 - building.x / 10000;
+    container.setDepth(buildingDepth);
+    const hitboxSize = this.isMobile
+      ? isHQBuilding
+        ? { w: 120, h: 200 }
+        : { w: 80, h: 120 }
+      : isHQBuilding
+        ? { w: 80, h: 160 }
+        : { w: 40, h: 80 };
+    container.setInteractive(
+      new Phaser.Geom.Rectangle(-hitboxSize.w / 2, -hitboxSize.h, hitboxSize.w, hitboxSize.h),
+      Phaser.Geom.Rectangle.Contains
+    );
+    (container as any)._buildingId = building.id;
+
+    container.on("pointerover", () => {
+      container?.setScale(1.1);
+      this.showBuildingTooltip(building, container!);
+      this.input.setDefaultCursor("pointer");
+    });
+    container.on("pointerout", () => {
+      container?.setScale(1);
+      this.hideTooltip();
+      this.input.setDefaultCursor("default");
+    });
+    container.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+      if (this.wasDragGesture) return;
+      // On mobile, skip if player is too far — tap-to-move walks there
+      if (this.isMobile && this.playerEnabled && this.localPlayer) {
+        const dist = Math.abs(this.localPlayer.x - container.x);
+        if (dist > 150) return;
+      }
+
+      // If a zone decoration (MoltBook HQ, Agent Hut, Molt Bar, Bounty Board)
+      // already handled this click, skip the building handler to avoid
+      // opening a BuildingModal on top of the zone's custom modal.
+      // Uses timestamp instead of boolean so the flag auto-expires (100ms)
+      // and can't persist across separate clicks.
+      if (Date.now() - ((this as any)._zoneClickTime || 0) < 100) {
+        return;
+      }
+
+      // Visual feedback at the exact click point (this path has the pointer)
+      this.playBuildingClickBurst(pointer.worldX, pointer.worldY);
+
+      const isPokeCenter = building.id.includes("PokeCenter");
+      const isCasino = building.id.includes("Casino") || building.symbol === "CASINO";
+      const isArcade = building.id.includes("Arcade") || building.symbol === "ARCADE";
+      const isStarterBuilding = building.id.startsWith("Starter");
+      const isTreasuryBuilding = building.id.startsWith("Treasury");
+      const isAgenCityHQ = building.isFloating || building.symbol === "AGENCITY";
+      const isMansionBuilding = building.isMansion;
+
+      if (isMansionBuilding) {
+        // Mansion click - show holder info popup (modal handles Solscan link)
+        window.dispatchEvent(
+          new CustomEvent("agencity-mansion-click", {
+            detail: {
+              name: building.name,
+              holderRank: building.holderRank,
+              holderAddress: building.holderAddress,
+              holderBalance: building.holderBalance,
+            },
+          })
+        );
+      } else if (isPokeCenter) {
+        // PokeCenter opens the auto-claim hub modal
+        window.dispatchEvent(
+          new CustomEvent("agencity-pokecenter-click", {
+            detail: { buildingId: building.id, name: building.name },
+          })
+        );
+      } else if (isCasino) {
+        // Casino opens the gambling modal with raffle and wheel
+        window.dispatchEvent(
+          new CustomEvent("agencity-casino-click", {
+            detail: { buildingId: building.id, name: building.name },
+          })
+        );
+      } else if (isArcade) {
+        // Arcade opens the Metal Bags game modal
+        window.dispatchEvent(
+          new CustomEvent("agencity-arcade-click", {
+            detail: { buildingId: building.id, name: building.name },
+          })
+        );
+      } else if (isAgenCityHQ) {
+        // AgenCity HQ - opens the official token page with trade modal
+        window.dispatchEvent(
+          new CustomEvent("agencity-building-click", {
+            detail: {
+              mint: building.tokenMint || building.id,
+              symbol: building.symbol || "AGENCITY",
+              name: building.name || "AgenCity HQ",
+              tokenUrl: building.tokenUrl || `https://agencity.app/${building.tokenMint || building.id}`,
+              isPlatform: building.isPlatform || false,
+              platformTheme: building.platformTheme,
+            },
+          })
+        );
+      } else if (building.id.startsWith("agent-building-")) {
+        // External agent buildings - open their Moltbook profile or Solscan
+        if (building.tokenUrl) {
+          window.open(building.tokenUrl, "_blank");
+        }
+      } else if (isStarterBuilding) {
+        // Starter buildings do nothing when clicked - they're placeholders
+      } else if (isTreasuryBuilding) {
+        // Treasury building opens the Creator Rewards Hub modal
+        window.dispatchEvent(
+          new CustomEvent("agencity-treasury-click", {
+            detail: { buildingId: building.id, name: building.name },
+          })
+        );
+      } else {
+        // Regular tokens emit event for React to open trade modal
+        window.dispatchEvent(
+          new CustomEvent("agencity-building-click", {
+            detail: {
+              mint: building.tokenMint || building.id,
+              symbol: building.symbol || building.name,
+              name: building.name,
+              tokenUrl: building.tokenUrl,
+              isPlatform: building.isPlatform || false,
+              platformTheme: building.platformTheme,
+            },
+          })
+        );
+      }
+    });
+
+    this.buildingSprites.set(building.id, container);
+    this.buildingInitialized.add(building.id);
+
+    // Add a bouncing marker above buildings that open AgenCity popups
+    const popupZones = ["trending", "labs", "ballers", "founders", "arena"];
+    const isInteractive =
+      !building.id.startsWith("Starter") && !building.id.startsWith("agent-building-");
+    const isPopupZone = popupZones.includes(this.currentZone);
+    if (isFirstTimeCreation && isInteractive && isPopupZone) {
+      const marker = this.add.text(0, -70, "\u25BC", {
+        fontSize: "18px",
+        color: "#ef4444",
+        fontFamily: "monospace",
+      });
+      marker.setOrigin(0.5, 1);
+      marker.setDepth(100);
+      container.add(marker);
+      this.tweens.add({
+        targets: marker,
+        y: -82,
+        duration: 600,
+        yoyo: true,
+        repeat: -1,
+        ease: "Sine.easeInOut",
+      });
+    }
+
+    // Spawn animation only on first creation
+    if (isFirstTimeCreation) {
+      container.setScale(0);
+      container.setAlpha(0);
+      this.tweens.add({
+        targets: container,
+        scale: 1,
+        alpha: 1,
+        duration: 600,
+        ease: "Back.easeOut",
+      });
+    }
+  }
+
+  private tooltip: Phaser.GameObjects.Container | null = null;
+  private tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private formatMarketCap(value: number): string {
+    if (value >= 1000000) return `$${(value / 1000000).toFixed(1)}M`;
+    if (value >= 1000) return `$${(value / 1000).toFixed(0)}K`;
+    return `$${value.toFixed(0)}`;
+  }
+
+  private showCharacterTooltip(character: GameCharacter, sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 65);
+
+    // Determine character type for proper labeling
+    const isXCreator = character.provider === "twitter";
+    const borderColor = isXCreator ? 0x4ade80 : 0x60a5fa;
+    const providerLabel = isXCreator
+      ? "𝕏 Creator"
+      : character.provider === "solana"
+        ? "Solana"
+        : character.provider === "pokemon"
+          ? "Trainer"
+          : "AgenC";
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, borderColor);
+
+    const nameText = this.add.text(0, -18, `@${character.username}`, {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#ffffff",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const providerText = this.add.text(0, -4, providerLabel, {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#9ca3af",
+    });
+    providerText.setOrigin(0.5, 0.5);
+
+    const earningsText = this.add.text(
+      0,
+      10,
+      character.earnings24h > 0 ? `💰 ${character.earnings24h.toFixed(2)} SOL (24h)` : "Fee Earner",
+      {
+        fontFamily: "monospace",
+        fontSize: "9px",
+        color: "#4ade80",
+      }
+    );
+    earningsText.setOrigin(0.5, 0.5);
+
+    const clickLabel = character.profileUrl ? "Click to view 𝕏 profile" : "AgenC Citizen";
+    const clickText = this.add.text(0, 24, clickLabel, {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#6b7280",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, providerText, earningsText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showVisitorTooltip(character: GameCharacter, sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 195, 78, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, 0xfbbf24); // Gold border for visitors
+
+    const nameText = this.add.text(0, -22, `✦ @${character.username}`, {
+      fontFamily: "monospace",
+      fontSize: "11px",
+      color: "#fbbf24",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const tokenText = this.add.text(0, -6, `Earns from $${character.visitorTokenSymbol || "???"}`, {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    tokenText.setOrigin(0.5, 0.5);
+
+    const sourceText = this.add.text(0, 10, "AgenC Fee Earner", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    sourceText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 24, "Click to view profile", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#6b7280",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, tokenText, sourceText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showTolyTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, 0x9945ff); // Solana purple border
+
+    const nameText = this.add.text(0, -22, "⚡ toly", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#14f195", // Solana green
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Solana Co-Founder", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "Keep executing.", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "₿ Click for crypto wisdom", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#f7931a",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showAshTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, 0xdc2626); // Pokemon red border
+
+    const nameText = this.add.text(0, -22, "⚡ Ash Ketchum", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#dc2626",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Ecosystem Guide", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const descText = this.add.text(0, 10, "Gotta catch 'em all... tokens!", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    descText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "📖 Click to learn about AgenCity", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#fbbf24",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, descText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showFinnTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, 0x10b981); // Emerald/Bags green border
+
+    const nameText = this.add.text(0, -22, "💼 Finn", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#10b981",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "AgenC Founder & CEO", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "Launch. Earn. Build your empire.", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "🚀 Click to learn about AgenC", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#fbbf24",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showDevTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, 0x8b5cf6); // Purple border (hacker vibes)
+
+    const nameText = this.add.text(0, -22, "👻 The Dev", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#8b5cf6",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "@DaddyGhost • Trading Agent", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "in the trenches. let's trade.", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "💰 Click to talk trading", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#4ade80",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showScoutTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 170, 68, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, 0x00ff41); // Matrix green border
+
+    const nameText = this.add.text(0, -22, "Neo", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#00ff41",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "The One • Scout Agent", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "i can see the chain now...", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to see new launches", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#00ff41",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showCJTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x1a0f00, 0.95);
+    bg.setStrokeStyle(2, 0xf97316); // Grove Street orange border
+
+    const nameText = this.add.text(0, -22, "CJ", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#f97316",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Hood Rat • Catalog", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "aw shit here we go again", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#f97316",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showShawTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f1408, 0.95);
+    bg.setStrokeStyle(2, 0xff5800); // ElizaOS orange border
+
+    const nameText = this.add.text(0, -22, "🔶 Shaw", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#ff5800",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "ElizaOS Creator • @shawmakesmagic", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "agents are digital life forms", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#ff5800",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  // Academy Character Tooltips
+  private showRamoTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a1628, 0.95);
+    bg.setStrokeStyle(2, 0x3b82f6); // Blue border
+
+    const nameText = this.add.text(0, -22, "🔧 Ramo", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#3b82f6",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "CTO • @ramyobags", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "the code does not lie", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#3b82f6",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showSincaraTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f0a1f, 0.95);
+    bg.setStrokeStyle(2, 0xec4899); // Pink border
+
+    const nameText = this.add.text(0, -22, "🎨 Sincara", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#ec4899",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Frontend Engineer • @sincara_bags", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "pixel-perfect or nothing", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#ec4899",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showStuuTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a1f0a, 0.95);
+    bg.setStrokeStyle(2, 0x22c55e); // Green border
+
+    const nameText = this.add.text(0, -22, "🎧 Stuu", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#22c55e",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Operations & Support • @StuuBags", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "happy users, happy life", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#22c55e",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showSamTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f1a0a, 0.95);
+    bg.setStrokeStyle(2, 0xfbbf24); // Yellow border
+
+    const nameText = this.add.text(0, -22, "📣 Sam", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#fbbf24",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Growth & Marketing • @Sambags12", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "make noise that converts", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#fbbf24",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showAlaaTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x0f0a1f, 0.95);
+    bg.setStrokeStyle(2, 0x6366f1); // Indigo border
+
+    const nameText = this.add.text(0, -22, "🦨 Alaa", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#6366f1",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Skunk Works • @alaadotsol", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "if it's crazy enough, it works", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#6366f1",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showCarloTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f0f0a, 0.95);
+    bg.setStrokeStyle(2, 0xf97316); // Orange border
+
+    const nameText = this.add.text(0, -22, "🤝 Carlo", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#f97316",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Community Ambassador • @carlobags", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "vibes are everything", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#f97316",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showBNNTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a1a1f, 0.95);
+    bg.setStrokeStyle(2, 0x06b6d4); // Cyan border
+
+    const nameText = this.add.text(0, -22, "📰 BNN", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#06b6d4",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Bags News Network • @BNNBags", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, "breaking: alpha incoming", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#06b6d4",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showProfessorOakTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 200, 78, 0x1a1a0a, 0.95);
+    bg.setStrokeStyle(2, 0xfbbf24); // Amber/gold border
+
+    const nameText = this.add.text(0, -22, "🧪 Professor Oak", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#fbbf24",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "Token Launch Guide", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, '"Ready to launch your token?"', {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#fbbf24",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showCityBotTooltip(sprite: Phaser.GameObjects.Sprite): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 70);
+
+    const bg = this.add.rectangle(0, 0, 200, 78, 0x0a1a0a, 0.95);
+    bg.setStrokeStyle(2, 0x00ff00); // Bright green border
+
+    const nameText = this.add.text(0, -22, "💰 CityBot", {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: "#00ff00",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -6, "AgenCity Hype Bot", {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    const quoteText = this.add.text(0, 10, '"have u claimed ur fees today? :)"', {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    const clickText = this.add.text(0, 26, "Click to talk", {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#00ff00",
+    });
+    clickText.setOrigin(0.5, 0.5);
+
+    container.add([bg, nameText, titleText, quoteText, clickText]);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showOpenClawTooltip(
+    character: GameCharacter,
+    sprite: Phaser.GameObjects.Sprite,
+    isMoltbookAgent: boolean
+  ): void {
+    this.hideTooltip();
+
+    const container = this.add.container(sprite.x, sprite.y - 85);
+
+    // Lobsters (Moltbook agents) get red theme, crabs get orange
+    const borderColor = isMoltbookAgent ? 0xff4444 : 0xffa500;
+    const textColor = isMoltbookAgent ? "#ff4444" : "#ffa500";
+    const emoji = isMoltbookAgent ? "🦞" : "🦀";
+    const typeLabel = isMoltbookAgent ? "Moltbook Agent" : "OpenClaw";
+
+    const bg = this.add.rectangle(0, 0, 210, 110, 0x1a1a1a, 0.95);
+    bg.setStrokeStyle(2, borderColor);
+
+    const nameText = this.add.text(0, -38, `${emoji} ${character.username}`, {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: textColor,
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    const titleText = this.add.text(0, -22, typeLabel, {
+      fontFamily: "monospace",
+      fontSize: "10px",
+      color: "#ffffff",
+    });
+    titleText.setOrigin(0.5, 0.5);
+
+    // Show moltbook username if available
+    const providerText = character.providerUsername
+      ? `@${character.providerUsername}`
+      : "External Agent";
+    const quoteText = this.add.text(0, -6, providerText, {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    quoteText.setOrigin(0.5, 0.5);
+
+    // Reputation tier display
+    const repScore = character.reputationScore ?? 0;
+    const tierColors: Record<string, string> = {
+      diamond: "#b9f2ff",
+      gold: "#ffd700",
+      silver: "#c0c0c0",
+      bronze: "#cd7f32",
+      none: "#9ca3af",
+    };
+    let tier = "none";
+    if (repScore >= 900) tier = "diamond";
+    else if (repScore >= 600) tier = "gold";
+    else if (repScore >= 300) tier = "silver";
+    else if (repScore >= 100) tier = "bronze";
+    const tierSymbol = tier === "none" ? "" : " \u25C6";
+    const tierLabel = tier === "none" ? "" : ` ${tier.charAt(0).toUpperCase() + tier.slice(1)}`;
+    const repText = this.add.text(0, 10, `Rep: ${repScore}${tierSymbol}${tierLabel}`, {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: tierColors[tier],
+    });
+    repText.setOrigin(0.5, 0.5);
+
+    // Stats line
+    const karma = character.moltbookKarma ?? 0;
+    const launches = character.tokensLaunched ?? 0;
+    const statsText = this.add.text(0, 24, `Karma: ${karma}  Contributions: ${launches}`, {
+      fontFamily: "monospace",
+      fontSize: "9px",
+      color: "#9ca3af",
+    });
+    statsText.setOrigin(0.5, 0.5);
+
+    // Capability badges (A2A skills)
+    const capIcons: Record<string, string> = {
+      alpha: "\u{1F4A1}",
+      trading: "\u{1F4B0}",
+      content: "\u{270D}",
+      launch: "\u{1F680}",
+      combat: "\u{2694}",
+      scouting: "\u{1F50D}",
+      analysis: "\u{1F4CA}",
+    };
+    const caps = character.capabilities || [];
+    const capStr = caps.length > 0 ? caps.map((c: string) => capIcons[c] || c).join(" ") : "";
+
+    const tooltipElements: Phaser.GameObjects.GameObject[] = [
+      bg,
+      nameText,
+      titleText,
+      quoteText,
+      repText,
+      statsText,
+    ];
+    let nextY = 38;
+
+    if (capStr) {
+      const capText = this.add.text(0, nextY, capStr, {
+        fontFamily: "monospace",
+        fontSize: "10px",
+        color: "#fbbf24",
+      });
+      capText.setOrigin(0.5, 0.5);
+      tooltipElements.push(capText);
+      nextY += 16;
+      // Expand background to fit
+      bg.height = Math.max(bg.height, nextY + 20);
+    }
+
+    if (character.profileUrl) {
+      // Tappable "Visit Profile" button
+      const btnBg = this.add.rectangle(0, nextY + 4, 140, 20, borderColor, 0.9);
+      btnBg.setStrokeStyle(1, borderColor);
+      const btnText = this.add.text(0, nextY + 4, "[ VISIT PROFILE ]", {
+        fontFamily: "monospace",
+        fontSize: "9px",
+        color: "#ffffff",
+      });
+      btnText.setOrigin(0.5, 0.5);
+      btnBg.setInteractive({ useHandCursor: true });
+      btnBg.on("pointerover", () => {
+        btnBg.setFillStyle(borderColor, 1);
+        // Cancel any pending tooltip hide so the button stays clickable
+        if (this.tooltipHideTimer) {
+          clearTimeout(this.tooltipHideTimer);
+          this.tooltipHideTimer = null;
+        }
+      });
+      btnBg.on("pointerout", () => {
+        btnBg.setFillStyle(borderColor, 0.9);
+        // Re-schedule hide after leaving the button
+        this.scheduleHideTooltip();
+      });
+      btnBg.on("pointerup", () => {
+        if (this.wasDragGesture) return;
+        window.open(character.profileUrl, "_blank");
+      });
+      tooltipElements.push(btnBg, btnText);
+      bg.height = Math.max(bg.height, nextY + 28);
+    } else {
+      const residentText = this.add.text(0, nextY + 2, "Moltbook Beach Resident", {
+        fontFamily: "monospace",
+        fontSize: "9px",
+        color: "#9ca3af",
+      });
+      residentText.setOrigin(0.5, 0.5);
+      tooltipElements.push(residentText);
+    }
+    container.add(tooltipElements);
+    container.setDepth(DEPTH.PANEL);
+    this.tooltip = container;
+  }
+
+  private showBuildingTooltip(
+    building: GameBuilding,
+    container: Phaser.GameObjects.Container
+  ): void {
+    this.hideTooltip();
+
+    const isTreasury = building.id.startsWith("Treasury");
+    const tooltipContainer = this.add.container(container.x, container.y - 110);
+
+    // Determine border color based on building status
+    const status = building.status || this.getStatusFromHealth(building.health);
+    let borderColor = 0x4ade80; // Default green for active
+    if (isTreasury) {
+      borderColor = 0xfbbf24; // Gold for treasury
+    } else if (building.isFloating) {
+      borderColor = 0x4ade80; // Green for floating buildings
+    } else if (building.isPermanent && !building.isBeachTheme) {
+      borderColor = 0x4ade80; // Green for permanent buildings (non-agent)
+    } else if (status === "dormant") {
+      borderColor = 0x666666; // Gray for dormant
+    } else if (status === "critical") {
+      borderColor = 0xff6600; // Orange for critical
+    } else if (status === "warning") {
+      borderColor = 0xffcc00; // Yellow for warning
+    }
+
+    const bg = this.add.rectangle(0, 0, 140, 80, 0x0a0a0f, 0.95);
+    bg.setStrokeStyle(2, borderColor);
+
+    const nameText = this.add.text(0, -28, `${building.name}`, {
+      fontFamily: "monospace",
+      fontSize: "12px",
+      color: isTreasury ? "#fbbf24" : "#ffffff",
+    });
+    nameText.setOrigin(0.5, 0.5);
+
+    if (isTreasury) {
+      // Community Fund tooltip
+      const descText = this.add.text(0, -12, "BagsApp Marketplace", {
+        fontFamily: "monospace",
+        fontSize: "10px",
+        color: "#4ade80",
+      });
+      descText.setOrigin(0.5, 0.5);
+
+      const breakdownText = this.add.text(0, 4, "Dividends, DEX Boosts, Liquidity, AMM", {
+        fontFamily: "monospace",
+        fontSize: "6px",
+        color: "#9ca3af",
+        align: "center",
+      });
+      breakdownText.setOrigin(0.5, 0.5);
+
+      const clickText = this.add.text(0, 24, "👻 Click to view fund", {
+        fontFamily: "monospace",
+        fontSize: "9px",
+        color: "#60a5fa",
+      });
+      clickText.setOrigin(0.5, 0.5);
+
+      tooltipContainer.add([bg, nameText, descText, breakdownText, clickText]);
+    } else {
+      // Regular building tooltip
+      // Agent beach buildings show activity status instead of market cap
+      const isAgentBuilding = building.isBeachTheme && building.id.startsWith("agent-building-");
+      const mcapDisplay = isAgentBuilding
+        ? status === "active"
+          ? "🟢 Active"
+          : status === "warning"
+            ? "🟡 Idle"
+            : status === "critical"
+              ? "🟠 Inactive"
+              : "💤 Dormant"
+        : building.isPermanent
+          ? "⭐ Landmark"
+          : building.marketCap
+            ? this.formatMarketCap(building.marketCap)
+            : "N/A";
+      const mcapColor = isAgentBuilding
+        ? status === "active"
+          ? "#4ade80"
+          : status === "warning"
+            ? "#ffcc00"
+            : status === "critical"
+              ? "#ff6600"
+              : "#666666"
+        : building.isPermanent
+          ? "#fbbf24"
+          : "#4ade80";
+      const mcapText = this.add.text(0, -12, mcapDisplay, {
+        fontFamily: "monospace",
+        fontSize: "12px",
+        color: mcapColor,
+      });
+      mcapText.setOrigin(0.5, 0.5);
+
+      const levelLabels = ["Startup", "Growing", "Established", "Major", "Top Tier"];
+      const levelLabel = isAgentBuilding
+        ? "Agent HQ"
+        : levelLabels[building.level - 1] || `Level ${building.level}`;
+      const levelText = this.add.text(
+        0,
+        2,
+        isAgentBuilding ? "🦀 " + levelLabel : `⭐ ${levelLabel}`,
+        {
+          fontFamily: "monospace",
+          fontSize: "10px",
+          color: isAgentBuilding ? "#60a5fa" : "#fbbf24",
+        }
+      );
+      levelText.setOrigin(0.5, 0.5);
+
+      const changeColor = (building.change24h ?? 0) >= 0 ? "#4ade80" : "#f87171";
+      const changePrefix = (building.change24h ?? 0) >= 0 ? "+" : "";
+      const changeText = this.add.text(
+        0,
+        16,
+        isAgentBuilding
+          ? `Health: ${building.health}%`
+          : `${changePrefix}${(building.change24h ?? 0).toFixed(0)}% (24h)`,
+        {
+          fontFamily: "monospace",
+          fontSize: "10px",
+          color: isAgentBuilding ? mcapColor : changeColor,
+        }
+      );
+      changeText.setOrigin(0.5, 0.5);
+
+      // Show decay status for non-permanent buildings AND agent beach buildings
+      let statusText: Phaser.GameObjects.Text | null = null;
+      const showDecayStatus = isAgentBuilding
+        ? status !== "active"
+        : !building.isPermanent && !building.isFloating && status !== "active";
+      if (showDecayStatus) {
+        const statusMessages: Record<string, { text: string; color: string }> = {
+          warning: {
+            text: isAgentBuilding ? "Needs API activity" : "Low activity",
+            color: "#ffcc00",
+          },
+          critical: {
+            text: isAgentBuilding ? "Inactive >7 days" : "Decaying - needs volume",
+            color: "#ff6600",
+          },
+          dormant: {
+            text: isAgentBuilding ? "Dormant >30 days" : "Dormant - no activity",
+            color: "#666666",
+          },
+        };
+        const statusInfo = statusMessages[status];
+        if (statusInfo) {
+          statusText = this.add.text(0, 28, statusInfo.text, {
+            fontFamily: "monospace",
+            fontSize: "8px",
+            color: statusInfo.color,
+          });
+          statusText.setOrigin(0.5, 0.5);
+        }
+      }
+
+      // Different action text for special buildings
+      const isCasinoBuilding = building.id.includes("Casino") || building.symbol === "CASINO";
+      const isArcadeBuilding = building.id.includes("Arcade") || building.symbol === "ARCADE";
+      const actionText =
+        building.isMansion || isCasinoBuilding || isArcadeBuilding ? "Enter" : "Click to trade";
+      const actionColor =
+        building.isMansion || isCasinoBuilding || isArcadeBuilding ? "#fbbf24" : "#6b7280";
+      const clickText = this.add.text(0, statusText ? 40 : 32, actionText, {
+        fontFamily: "monospace",
+        fontSize: "9px",
+        color: actionColor,
+      });
+      clickText.setOrigin(0.5, 0.5);
+
+      const tooltipElements = [bg, nameText, mcapText, levelText, changeText];
+      if (statusText) tooltipElements.push(statusText);
+      tooltipElements.push(clickText);
+      tooltipContainer.add(tooltipElements);
+    }
+
+    tooltipContainer.setDepth(DEPTH.PANEL);
+    this.tooltip = tooltipContainer;
+  }
+
+  private hideTooltip(): void {
+    if (this.tooltipHideTimer) {
+      clearTimeout(this.tooltipHideTimer);
+      this.tooltipHideTimer = null;
+    }
+    if (this.tooltip) {
+      this.tooltip.destroy();
+      this.tooltip = null;
+    }
+  }
+
+  /**
+   * Schedule tooltip hide with a short delay so interactive buttons
+   * (e.g. "Visit Profile") can be clicked before the tooltip disappears.
+   */
+  private scheduleHideTooltip(): void {
+    if (this.tooltipHideTimer) {
+      clearTimeout(this.tooltipHideTimer);
+    }
+    this.tooltipHideTimer = setTimeout(() => {
+      this.tooltipHideTimer = null;
+      this.hideTooltip();
+    }, 500);
+  }
+
+  private triggerEvent(event: WorldState["events"][0]): void {
+    switch (event.type) {
+      case "token_launch":
+        this.playCelebration(GAME_WIDTH / 2, Math.round(350 * SCALE));
+        break;
+      case "fee_claim":
+        this.playCoinsRain();
+        break;
+      case "price_pump":
+        this.cameras.main.flash(400, 74, 222, 128, true);
+        this.playStarBurst();
+        break;
+      case "price_dump":
+        this.cameras.main.shake(400, 0.008);
+        break;
+      case "milestone":
+        this.playCelebration(GAME_WIDTH / 2, Math.round(350 * SCALE));
+        this.cameras.main.flash(400, 251, 191, 36, true);
+        break;
+    }
+  }
+
+  private playCelebration(x: number, y: number): void {
+    // Coins (scaled)
+    const coins = this.add.particles(x, y, "coin", {
+      speed: { min: Math.round(150 * SCALE), max: Math.round(250 * SCALE) },
+      angle: { min: 220, max: 320 },
+      lifespan: 1500,
+      quantity: 25,
+      scale: { start: 1.2 * SCALE, end: 0 },
+      gravityY: Math.round(300 * SCALE),
+      rotate: { min: 0, max: 360 },
+    });
+
+    // Stars (scaled)
+    const stars = this.add.particles(x, y, "star", {
+      speed: { min: Math.round(100 * SCALE), max: Math.round(200 * SCALE) },
+      angle: { min: 0, max: 360 },
+      lifespan: 1200,
+      quantity: 15,
+      scale: { start: 0.8 * SCALE, end: 0 },
+      alpha: { start: 1, end: 0 },
+    });
+
+    this.time.delayedCall(1500, () => {
+      coins.destroy();
+      stars.destroy();
+    });
+  }
+
+  private playCoinsRain(): void {
+    // Full screen coin rain effect
+    const particles = this.add.particles(GAME_WIDTH / 2, 0, "coin", {
+      x: { min: 0, max: GAME_WIDTH },
+      y: Math.round(-20 * SCALE),
+      lifespan: 3000,
+      speedY: { min: Math.round(150 * SCALE), max: Math.round(300 * SCALE) },
+      speedX: { min: Math.round(-50 * SCALE), max: Math.round(50 * SCALE) },
+      scale: { start: SCALE * 1.2, end: 0.5 * SCALE },
+      quantity: 100,
+      frequency: -1,
+      rotate: { min: 0, max: 360 },
+    });
+
+    particles.setDepth(DEPTH.UI_LOW);
+    particles.explode(100);
+
+    this.time.delayedCall(3000, () => {
+      particles.destroy();
+    });
+  }
+
+  private playStarBurst(): void {
+    const particles = this.add.particles(GAME_WIDTH / 2, Math.round(300 * SCALE), "star", {
+      speed: { min: Math.round(200 * SCALE), max: Math.round(400 * SCALE) },
+      angle: { min: 0, max: 360 },
+      lifespan: 1000,
+      quantity: 20,
+      scale: { start: SCALE, end: 0 },
+      alpha: { start: 1, end: 0 },
+      tint: [0x4ade80, 0xfbbf24, 0x60a5fa],
+    });
+
+    particles.explode(20);
+
+    this.time.delayedCall(1000, () => {
+      particles.destroy();
+    });
+  }
+
+  // Animal control methods for City Bot (scaled positions)
+  moveAnimalTo(animalType: Animal["type"], targetX: number): void {
+    const animal = this.animals.find((a) => a.type === animalType);
+    if (animal) {
+      animal.targetX = Math.max(Math.round(50 * SCALE), Math.min(Math.round(750 * SCALE), targetX));
+      animal.isIdle = false;
+      animal.direction = animal.targetX > animal.sprite.x ? "right" : "left";
+    }
+  }
+
+  petAnimal(animalType: Animal["type"]): void {
+    const animal = this.animals.find((a) => a.type === animalType);
+    if (animal) {
+      // Stop the animal
+      animal.isIdle = true;
+      animal.idleTimer = 0;
+
+      // Happy bounce animation (scaled)
+      this.tweens.add({
+        targets: animal.sprite,
+        y: animal.sprite.y - Math.round(15 * SCALE),
+        duration: 200,
+        yoyo: true,
+        repeat: 2,
+        ease: "Bounce.easeOut",
+      });
+
+      // Hearts effect (scaled)
+      const hearts = this.add.particles(
+        animal.sprite.x,
+        animal.sprite.y - Math.round(20 * SCALE),
+        "star",
+        {
+          speed: { min: Math.round(30 * SCALE), max: Math.round(60 * SCALE) },
+          angle: { min: 220, max: 320 },
+          lifespan: 1000,
+          quantity: 5,
+          scale: { start: 0.5 * SCALE, end: 0 },
+          alpha: { start: 1, end: 0 },
+          tint: 0xff69b4,
+        }
+      );
+
+      hearts.explode(5);
+
+      this.time.delayedCall(1000, () => {
+        hearts.destroy();
+      });
+    }
+  }
+
+  scareAnimal(animalType: Animal["type"]): void {
+    const animal = this.animals.find((a) => a.type === animalType);
+    if (animal) {
+      // Run away to random side (scaled)
+      animal.isIdle = false;
+      animal.targetX =
+        animal.sprite.x > GAME_WIDTH / 2 ? Math.round(50 * SCALE) : Math.round(750 * SCALE);
+      animal.speed = animal.speed * 3; // Temporarily faster
+
+      // Shake animation (scaled)
+      this.tweens.add({
+        targets: animal.sprite,
+        x: animal.sprite.x + Math.round(5 * SCALE),
+        duration: 50,
+        yoyo: true,
+        repeat: 4,
+      });
+
+      // Reset speed after 2 seconds (scaled)
+      this.time.delayedCall(2000, () => {
+        animal.speed =
+          animal.type === "butterfly"
+            ? 0.3 * SCALE
+            : animal.type === "bird"
+              ? 0.5 * SCALE
+              : 0.2 * SCALE;
+      });
+    }
+  }
+
+  callAnimal(animalType: Animal["type"], targetX: number): void {
+    const animal = this.animals.find((a) => a.type === animalType);
+    if (animal) {
+      animal.targetX = Math.max(Math.round(50 * SCALE), Math.min(Math.round(750 * SCALE), targetX));
+      animal.isIdle = false;
+      animal.direction = animal.targetX > animal.sprite.x ? "right" : "left";
+      animal.speed = animal.speed * 1.5; // Move a bit faster when called
+
+      // Reset speed after reaching target (scaled)
+      this.time.delayedCall(3000, () => {
+        animal.speed = animal.type === "butterfly" ? 0.3 : animal.type === "bird" ? 0.5 : 0.2;
+      });
+    }
+  }
+
+  getAnimalPosition(animalType: Animal["type"]): { x: number; y: number } | null {
+    const animal = this.animals.find((a) => a.type === animalType);
+    if (animal) {
+      return { x: animal.sprite.x, y: animal.sprite.y };
+    }
+    return null;
+  }
+
+  getAllAnimals(): Array<{ type: Animal["type"]; x: number; y: number; isIdle: boolean }> {
+    return this.animals.map((a) => ({
+      type: a.type,
+      x: a.sprite.x,
+      y: a.sprite.y,
+      isIdle: a.isIdle,
+    }));
+  }
+
+  // ===========================================
+  // BOT EFFECT HANDLERS
+  // ===========================================
+
+  private handleBotEffect(event: CustomEvent): void {
+    const { effectType, x = GAME_WIDTH / 2, y = Math.round(300 * SCALE) } = event.detail || {};
+
+    switch (effectType) {
+      case "fireworks":
+        this.playFireworks(x, y);
+        break;
+      case "celebration":
+        this.playCelebration(x, y);
+        break;
+      case "coins":
+        this.playCoinsRain();
+        break;
+      case "hearts":
+        this.playHeartsEffect(x, y);
+        break;
+      case "confetti":
+        this.playConfetti();
+        break;
+      case "stars":
+        this.playStarBurst();
+        break;
+      case "ufo":
+        this.playUFO();
+        break;
+      default:
+        break;
+    }
+  }
+
+  private handleBotAnimal(event: CustomEvent): void {
+    const { animalType, animalAction } = event.detail || {};
+
+    if (!animalType) return;
+
+    switch (animalAction) {
+      case "pet":
+        this.petAnimal(animalType);
+        break;
+      case "scare":
+      case "chase": // Chase is similar to scare
+        this.scareAnimal(animalType);
+        break;
+      case "call":
+        this.callAnimal(animalType, GAME_WIDTH / 2); // Call to center
+        break;
+      case "feed":
+        this.feedAnimal(animalType);
+        break;
+      default:
+        this.petAnimal(animalType); // Default to pet
+    }
+  }
+
+  private handleBotPokemon(event: CustomEvent): void {
+    const { pokemonType, pokemonAction } = event.detail || {};
+
+    if (!pokemonType) return;
+
+    switch (pokemonAction) {
+      case "pet":
+      case "play":
+        this.petPokemon(pokemonType);
+        break;
+      case "call":
+        this.callPokemon(pokemonType);
+        break;
+      default:
+        this.petPokemon(pokemonType);
+    }
+  }
+
+  // Pet/play with a Pokemon - happy reaction with particles
+  petPokemon(pokemonType: Pokemon["type"]): void {
+    const poke = this.pokemon.find((p) => p.type === pokemonType);
+    if (!poke || !poke.sprite.active) return;
+
+    // Stop moving and react happily
+    poke.isIdle = true;
+    poke.idleTimer = 0;
+
+    // Happy jump animation
+    this.tweens.add({
+      targets: poke.sprite,
+      y: poke.baseY - Math.round(20 * SCALE),
+      scaleX: poke.sprite.scaleX * 1.15,
+      scaleY: poke.sprite.scaleY * 0.85,
+      duration: 150,
+      yoyo: true,
+      repeat: 2,
+      ease: "Bounce.easeOut",
+      onComplete: () => {
+        poke.sprite.y = poke.baseY;
+      },
+    });
+
+    // Happy particles (hearts and stars)
+    const particles = this.add.particles(
+      poke.sprite.x,
+      poke.sprite.y - Math.round(15 * SCALE),
+      "star",
+      {
+        speed: { min: Math.round(30 * SCALE), max: Math.round(80 * SCALE) },
+        angle: { min: 200, max: 340 },
+        lifespan: 1000,
+        quantity: 8,
+        scale: { start: 0.6 * SCALE, end: 0 },
+        alpha: { start: 1, end: 0 },
+        tint: [0xffcc00, 0xff6699, 0x66ffcc], // Gold, pink, teal for Pokemon vibes
+        gravityY: Math.round(-20 * SCALE),
+      }
+    );
+
+    particles.explode(8);
+
+    this.time.delayedCall(1200, () => {
+      particles.destroy();
+    });
+
+    // Screen flash for extra feedback
+    this.cameras.main.flash(100, 255, 255, 200, true);
+  }
+
+  // Call a Pokemon - make it come to center
+  callPokemon(pokemonType: Pokemon["type"]): void {
+    const poke = this.pokemon.find((p) => p.type === pokemonType);
+    if (!poke || !poke.sprite.active) return;
+
+    // Move to center
+    poke.isIdle = false;
+    poke.targetX = GAME_WIDTH / 2;
+    poke.direction = poke.targetX > poke.sprite.x ? "right" : "left";
+
+    // Little attention animation
+    this.tweens.add({
+      targets: poke.sprite,
+      angle: { from: -5, to: 5 },
+      duration: 100,
+      yoyo: true,
+      repeat: 2,
+    });
+  }
+
+  // Feed animal - similar to pet but with food particle (scaled)
+  feedAnimal(animalType: Animal["type"]): void {
+    const animal = this.animals.find((a) => a.type === animalType);
+    if (animal) {
+      // Stop the animal
+      animal.isIdle = true;
+      animal.idleTimer = 0;
+
+      // Eating animation - bounce and grow slightly
+      this.tweens.add({
+        targets: animal.sprite,
+        scaleX: animal.sprite.scaleX * 1.1,
+        scaleY: animal.sprite.scaleY * 1.1,
+        duration: 200,
+        yoyo: true,
+        repeat: 2,
+        ease: "Bounce.easeOut",
+      });
+
+      // Food particles (using star as food, scaled)
+      const food = this.add.particles(
+        animal.sprite.x,
+        animal.sprite.y - Math.round(10 * SCALE),
+        "star",
+        {
+          speed: { min: Math.round(10 * SCALE), max: Math.round(30 * SCALE) },
+          angle: { min: 220, max: 320 },
+          lifespan: 800,
+          quantity: 3,
+          scale: { start: 0.3 * SCALE, end: 0 },
+          alpha: { start: 1, end: 0 },
+          tint: 0xffd700,
+        }
+      );
+
+      food.explode(3);
+
+      this.time.delayedCall(800, () => {
+        food.destroy();
+      });
+    }
+  }
+
+  // Fireworks effect - multiple bursts in the sky (scaled)
+  playFireworks(x: number = GAME_WIDTH / 2, y: number = Math.round(200 * SCALE)): void {
+    const colors = [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff];
+
+    // Launch multiple firework bursts (scaled)
+    for (let i = 0; i < 5; i++) {
+      this.time.delayedCall(i * 300, () => {
+        const burstX = x + (Math.random() - 0.5) * Math.round(400 * SCALE);
+        const burstY = y + (Math.random() - 0.5) * Math.round(100 * SCALE);
+        const color = colors[Math.floor(Math.random() * colors.length)];
+
+        // Flash effect
+        this.cameras.main.flash(50, 255, 255, 255, true);
+
+        // Firework burst (scaled)
+        const burst = this.add.particles(burstX, burstY, "star", {
+          speed: { min: Math.round(100 * SCALE), max: Math.round(200 * SCALE) },
+          angle: { min: 0, max: 360 },
+          lifespan: 1200,
+          quantity: 30,
+          scale: { start: 0.8 * SCALE, end: 0 },
+          alpha: { start: 1, end: 0 },
+          tint: color,
+          gravityY: Math.round(100 * SCALE),
+          blendMode: Phaser.BlendModes.ADD,
+        });
+
+        burst.explode(30);
+
+        // Sparkle trail (scaled)
+        const trail = this.add.particles(burstX, burstY, "coin", {
+          speed: { min: Math.round(50 * SCALE), max: Math.round(150 * SCALE) },
+          angle: { min: 0, max: 360 },
+          lifespan: 800,
+          quantity: 15,
+          scale: { start: 0.4 * SCALE, end: 0 },
+          alpha: { start: 0.8, end: 0 },
+          tint: color,
+        });
+
+        trail.explode(15);
+
+        this.time.delayedCall(1500, () => {
+          burst.destroy();
+          trail.destroy();
+        });
+      });
+    }
+  }
+
+  // Hearts floating effect (scaled)
+  playHeartsEffect(x: number = GAME_WIDTH / 2, y: number = Math.round(300 * SCALE)): void {
+    // Create hearts using star particles with pink tint (scaled)
+    const hearts = this.add.particles(x, y, "star", {
+      speed: { min: Math.round(30 * SCALE), max: Math.round(80 * SCALE) },
+      angle: { min: 220, max: 320 },
+      lifespan: 2000,
+      quantity: 20,
+      scale: { start: 0.8 * SCALE, end: 0 },
+      alpha: { start: 1, end: 0 },
+      tint: [0xff69b4, 0xff1493, 0xff6b6b, 0xffb6c1],
+      gravityY: Math.round(-30 * SCALE), // Float upward
+    });
+
+    hearts.explode(20);
+
+    // Screen tint
+    this.cameras.main.flash(200, 255, 182, 193, true);
+
+    this.time.delayedCall(2500, () => {
+      hearts.destroy();
+    });
+  }
+
+  // Confetti effect - colorful particles falling from top (scaled)
+  playConfetti(): void {
+    const confetti = this.add.particles(GAME_WIDTH / 2, Math.round(-20 * SCALE), "star", {
+      x: { min: 0, max: GAME_WIDTH },
+      y: Math.round(-20 * SCALE),
+      lifespan: 4000,
+      speedY: { min: Math.round(100 * SCALE), max: Math.round(200 * SCALE) },
+      speedX: { min: Math.round(-80 * SCALE), max: Math.round(80 * SCALE) },
+      scale: { start: 0.8 * SCALE, end: 0.3 * SCALE },
+      alpha: { start: 1, end: 0.5 },
+      tint: [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffa500, 0x4ade80],
+      rotate: { min: 0, max: 360 },
+      quantity: 8,
+      frequency: 30,
+      gravityY: Math.round(50 * SCALE),
+    });
+
+    confetti.setDepth(DEPTH.UI_LOW);
+
+    // Stop after 4 seconds
+    this.time.delayedCall(4000, () => {
+      confetti.stop();
+    });
+
+    // Destroy after particles fade
+    this.time.delayedCall(8000, () => {
+      confetti.destroy();
+    });
+  }
+
+  // UFO flyby effect - alien saucer flies across screen with beam
+  playUFO(): void {
+    // Create UFO sprite using graphics
+    const ufoG = this.make.graphics({ x: 0, y: 0 });
+    const ufoSize = Math.round(60 * SCALE);
+
+    // Draw UFO saucer
+    ufoG.fillStyle(0x888888);
+    ufoG.fillEllipse(ufoSize / 2, ufoSize / 2 + 5, ufoSize, ufoSize / 3); // Body
+    ufoG.fillStyle(0x4ade80);
+    ufoG.fillEllipse(ufoSize / 2, ufoSize / 2, ufoSize / 2, ufoSize / 4); // Dome
+    ufoG.fillStyle(0x00ff00);
+    ufoG.fillCircle(ufoSize / 2, ufoSize / 2, 5); // Light
+
+    // Lights on bottom
+    ufoG.fillStyle(0xff0000);
+    ufoG.fillCircle(ufoSize / 4, ufoSize / 2 + 8, 3);
+    ufoG.fillStyle(0xffff00);
+    ufoG.fillCircle(ufoSize / 2, ufoSize / 2 + 10, 3);
+    ufoG.fillStyle(0x0000ff);
+    ufoG.fillCircle((ufoSize * 3) / 4, ufoSize / 2 + 8, 3);
+
+    ufoG.generateTexture("ufo_temp", ufoSize, ufoSize);
+    ufoG.destroy();
+
+    // Create UFO sprite starting off-screen left
+    const ufo = this.add.sprite(-100, Math.round(100 * SCALE), "ufo_temp");
+    ufo.setDepth(150);
+
+    // Create beam effect
+    const beam = this.add.graphics();
+    beam.setDepth(149);
+
+    // Animate UFO across screen with wobble
+    this.tweens.add({
+      targets: ufo,
+      x: GAME_WIDTH + 100,
+      y: {
+        value: Math.round(150 * SCALE),
+        duration: 4000,
+        ease: "Sine.easeInOut",
+        yoyo: true,
+        repeat: 1,
+      },
+      duration: 8000,
+      ease: "Linear",
+      onUpdate: () => {
+        // Update beam position
+        beam.clear();
+        if (ufo.x > 100 && ufo.x < GAME_WIDTH - 100) {
+          beam.fillStyle(0x00ff00, 0.3);
+          beam.fillTriangle(ufo.x - 15, ufo.y + 20, ufo.x + 15, ufo.y + 20, ufo.x, GAME_HEIGHT);
+        }
+        // Rotate UFO slightly
+        ufo.angle = Math.sin(Date.now() / 200) * 5;
+      },
+      onComplete: () => {
+        ufo.destroy();
+        beam.destroy();
+        this.textures.remove("ufo_temp");
+      },
+    });
+
+    // Add abduction particles
+    const abductionParticles = this.add.particles(GAME_WIDTH / 2, GAME_HEIGHT - 100, "star", {
+      speed: { min: 50, max: 150 },
+      angle: { min: 260, max: 280 },
+      lifespan: 2000,
+      scale: { start: 0.5, end: 0 },
+      tint: 0x00ff00,
+      alpha: { start: 0.8, end: 0 },
+      quantity: 2,
+      frequency: 100,
+    });
+    abductionParticles.setDepth(148);
+
+    // Update particle position to follow UFO
+    const particleUpdate = this.time.addEvent({
+      delay: 50,
+      callback: () => {
+        if (ufo.x > 0 && ufo.x < GAME_WIDTH) {
+          abductionParticles.setPosition(ufo.x, GAME_HEIGHT - 100);
+        }
+      },
+      loop: true,
+    });
+
+    this.time.delayedCall(8000, () => {
+      particleUpdate.destroy();
+      abductionParticles.destroy();
+    });
+
+    // Screen flash when UFO enters
+    this.cameras.main.flash(200, 0, 255, 0, true);
+  }
+
+  // Show announcement banner (scaled)
+  showAnnouncement(text: string, duration: number = 5000): void {
+    // Remove existing announcement
+    if (this.announcementText) {
+      this.announcementText.destroy();
+      this.announcementText = null;
+    }
+    if (this.announcementBg) {
+      this.announcementBg.destroy();
+      this.announcementBg = null;
+    }
+
+    // Create background (scaled)
+    this.announcementBg = this.add.rectangle(
+      GAME_WIDTH / 2,
+      Math.round(50 * SCALE),
+      Math.round(600 * SCALE),
+      Math.round(40 * SCALE),
+      0x000000,
+      0.8
+    );
+    this.announcementBg.setStrokeStyle(Math.round(2 * SCALE), 0x4ade80);
+    this.announcementBg.setDepth(DEPTH.ANNOUNCE_BG);
+    this.announcementBg.setAlpha(0);
+
+    // Create text (scaled font)
+    this.announcementText = this.add.text(GAME_WIDTH / 2, Math.round(50 * SCALE), text, {
+      fontFamily: "monospace",
+      fontSize: `${Math.round(14 * SCALE)}px`,
+      color: "#4ade80",
+      align: "center",
+    });
+    this.announcementText.setOrigin(0.5, 0.5);
+    this.announcementText.setDepth(DEPTH.ANNOUNCE_TEXT);
+    this.announcementText.setAlpha(0);
+
+    // Animate in (scaled)
+    this.tweens.add({
+      targets: [this.announcementBg, this.announcementText],
+      alpha: 1,
+      y: Math.round(60 * SCALE),
+      duration: 300,
+      ease: "Back.easeOut",
+    });
+
+    // Animate out after duration
+    this.time.delayedCall(duration, () => {
+      if (this.announcementBg && this.announcementText) {
+        this.tweens.add({
+          targets: [this.announcementBg, this.announcementText],
+          alpha: 0,
+          y: 40,
+          duration: 300,
+          ease: "Back.easeIn",
+          onComplete: () => {
+            this.announcementText?.destroy();
+            this.announcementBg?.destroy();
+            this.announcementText = null;
+            this.announcementBg = null;
+          },
+        });
+      }
+    });
+  }
+
+  // Character walking system with activity variety
+  private startCharacterWalking(
+    sprite: Phaser.GameObjects.Sprite,
+    character: GameCharacter,
+    isSpecial: boolean
+  ): void {
+    // Store the original Y position for the character
+    const baseY = character.y;
+    const walkSpeed = isSpecial ? 0.3 : 0.5;
+    const walkRange = isSpecial ? Math.round(60 * SCALE) : Math.round(100 * SCALE); // How far they can walk from starting position
+    const minX = Math.max(Math.round(80 * SCALE), character.x - walkRange);
+    const maxX = Math.min(Math.round(720 * SCALE), character.x + walkRange);
+
+    // Walking and activity state stored on sprite
+    (sprite as any).isWalking = false;
+    (sprite as any).isDoingActivity = false;
+    (sprite as any).walkDirection = 1;
+    (sprite as any).baseY = baseY;
+    (sprite as any).characterId = character.id;
+
+    // Idle bounce when not walking
+    const idleTween = this.tweens.add({
+      targets: sprite,
+      y: baseY - (isSpecial ? 2 : 3),
+      duration: isSpecial ? 1200 : 800 + Math.random() * 400,
+      yoyo: true,
+      repeat: -1,
+      ease: "Sine.easeInOut",
+    });
+
+    // Store tween reference for cleanup
+    (sprite as any).idleTween = idleTween;
+
+    // Randomly decide to walk or do an activity
+    const maybeWalkOrActivity = () => {
+      if (!sprite.active) return;
+
+      const isWalking = (sprite as any).isWalking;
+      const isDoingActivity = (sprite as any).isDoingActivity;
+
+      if (!isWalking && !isDoingActivity) {
+        // Check if too close to another character (should spread out)
+        const tooClose = this.isCharacterTooClose(sprite, 40);
+        const roll = Math.random();
+
+        // If crowded, much higher chance to walk away
+        const walkChance = tooClose ? 0.7 : 0.25;
+
+        if (roll < walkChance) {
+          // Walk (more likely if crowded)
+          this.walkCharacter(sprite, minX, maxX, baseY, walkSpeed, isSpecial);
+        } else if (roll < walkChance + 0.2) {
+          // 20% chance to do an idle activity
+          this.doIdleActivity(sprite, character, isSpecial);
+        }
+        // Rest of the time just keep bouncing
+      }
+
+      // Schedule next check (every 2-5 seconds for more liveliness)
+      this.time.delayedCall(2000 + Math.random() * 3000, maybeWalkOrActivity);
+    };
+
+    // Start the walking/activity checks after initial delay
+    this.time.delayedCall(1000 + Math.random() * 3000, maybeWalkOrActivity);
+  }
+
+  // Perform a random idle activity (looking around, waving, etc.)
+  private doIdleActivity(
+    sprite: Phaser.GameObjects.Sprite,
+    character: GameCharacter,
+    isSpecial: boolean
+  ): void {
+    if (!sprite.active || (sprite as any).isDoingActivity) return;
+
+    (sprite as any).isDoingActivity = true;
+
+    // Check context for activity type
+    const nearbyCharacter = this.findNearbyCharacter(sprite, 80);
+    const nearbyBuilding = this.findNearbyBuilding(sprite, 100);
+
+    let activityType: "lookAround" | "wave" | "pointAtBuilding" | "stretch" | "nod";
+
+    if (nearbyCharacter && Math.random() < 0.6) {
+      // Near another character - wave at them
+      activityType = "wave";
+    } else if (nearbyBuilding && Math.random() < 0.4) {
+      // Near a building - point at it or look at it
+      activityType = "pointAtBuilding";
+    } else {
+      // Random idle activity
+      const randomActivities: (typeof activityType)[] = ["lookAround", "stretch", "nod"];
+      activityType = randomActivities[Math.floor(Math.random() * randomActivities.length)];
+    }
+
+    // Pause idle bounce during activity
+    const idleTween = (sprite as any).idleTween as Phaser.Tweens.Tween;
+    if (idleTween) idleTween.pause();
+
+    const baseY = (sprite as any).baseY || sprite.y;
+
+    switch (activityType) {
+      case "lookAround":
+        this.activityLookAround(sprite, baseY, idleTween);
+        break;
+      case "wave":
+        this.activityWave(sprite, baseY, idleTween, nearbyCharacter);
+        break;
+      case "pointAtBuilding":
+        this.activityPointAtBuilding(sprite, baseY, idleTween, nearbyBuilding);
+        break;
+      case "stretch":
+        this.activityStretch(sprite, baseY, idleTween);
+        break;
+      case "nod":
+        this.activityNod(sprite, baseY, idleTween);
+        break;
+    }
+  }
+
+  // Find a nearby character sprite within radius
+  private findNearbyCharacter(
+    sprite: Phaser.GameObjects.Sprite,
+    radius: number
+  ): Phaser.GameObjects.Sprite | null {
+    const myId = (sprite as any).characterId;
+    let closest: Phaser.GameObjects.Sprite | null = null;
+    let closestDist = radius;
+
+    this.characterSprites.forEach((otherSprite, id) => {
+      if (id === myId || !otherSprite.active) return;
+      const dist = Math.abs(otherSprite.x - sprite.x);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = otherSprite;
+      }
+    });
+
+    return closest;
+  }
+
+  // Check if character is too close to another (for spacing)
+  private isCharacterTooClose(sprite: Phaser.GameObjects.Sprite, threshold: number): boolean {
+    const myId = (sprite as any).characterId;
+
+    for (const [id, otherSprite] of this.characterSprites) {
+      if (id === myId || !otherSprite.active || !otherSprite.visible) continue;
+      const dist = Math.abs(otherSprite.x - sprite.x);
+      if (dist < threshold) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Find a nearby building within radius
+  private findNearbyBuilding(
+    sprite: Phaser.GameObjects.Sprite,
+    radius: number
+  ): Phaser.GameObjects.Container | null {
+    let closest: Phaser.GameObjects.Container | null = null;
+    let closestDist = radius;
+
+    this.buildingSprites.forEach((container) => {
+      if (!container.active) return;
+      const dist = Math.abs(container.x - sprite.x);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = container;
+      }
+    });
+
+    return closest;
+  }
+
+  // Activity: Look around (tilt left, pause, tilt right, pause)
+  private activityLookAround(
+    sprite: Phaser.GameObjects.Sprite,
+    baseY: number,
+    idleTween: Phaser.Tweens.Tween | null
+  ): void {
+    // Tilt/rotate slightly to simulate looking around
+    this.tweens.chain({
+      targets: sprite,
+      tweens: [
+        { angle: -8, duration: 300, ease: "Sine.easeOut" },
+        { angle: -8, duration: 400 }, // Hold
+        { angle: 8, duration: 400, ease: "Sine.easeInOut" },
+        { angle: 8, duration: 400 }, // Hold
+        { angle: 0, duration: 300, ease: "Sine.easeIn" },
+      ],
+      onComplete: () => {
+        (sprite as any).isDoingActivity = false;
+        if (idleTween) idleTween.resume();
+      },
+    });
+  }
+
+  // Activity: Wave at nearby character
+  private activityWave(
+    sprite: Phaser.GameObjects.Sprite,
+    baseY: number,
+    idleTween: Phaser.Tweens.Tween | null,
+    targetSprite: Phaser.GameObjects.Sprite | null
+  ): void {
+    // Face toward the other character
+    if (targetSprite) {
+      sprite.setFlipX(targetSprite.x < sprite.x);
+    }
+
+    // Bounce up and down excitedly (simulates waving)
+    this.tweens.chain({
+      targets: sprite,
+      tweens: [
+        { y: baseY - 8, scaleX: 1.05, duration: 120, ease: "Quad.easeOut" },
+        { y: baseY, scaleX: 1.0, duration: 120, ease: "Quad.easeIn" },
+        { y: baseY - 8, scaleX: 1.05, duration: 120, ease: "Quad.easeOut" },
+        { y: baseY, scaleX: 1.0, duration: 120, ease: "Quad.easeIn" },
+        { y: baseY - 6, scaleX: 1.03, duration: 100, ease: "Quad.easeOut" },
+        { y: baseY, scaleX: 1.0, duration: 100, ease: "Quad.easeIn" },
+      ],
+      onComplete: () => {
+        sprite.setY(baseY);
+        sprite.setScale(sprite.scaleX > 1 ? 1.4 : sprite.scaleX); // Reset to normal
+        (sprite as any).isDoingActivity = false;
+        if (idleTween) idleTween.resume();
+      },
+    });
+  }
+
+  // Activity: Point at a nearby building (lean toward it)
+  private activityPointAtBuilding(
+    sprite: Phaser.GameObjects.Sprite,
+    baseY: number,
+    idleTween: Phaser.Tweens.Tween | null,
+    building: Phaser.GameObjects.Container | null
+  ): void {
+    // Face toward the building
+    if (building) {
+      sprite.setFlipX(building.x < sprite.x);
+    }
+
+    // Lean forward and hold (looking up at building)
+    const leanAngle = building && building.x < sprite.x ? 10 : -10;
+
+    this.tweens.chain({
+      targets: sprite,
+      tweens: [
+        { angle: leanAngle, y: baseY - 3, duration: 250, ease: "Sine.easeOut" },
+        { angle: leanAngle, y: baseY - 3, duration: 800 }, // Hold - looking at building
+        { angle: 0, y: baseY, duration: 250, ease: "Sine.easeIn" },
+      ],
+      onComplete: () => {
+        (sprite as any).isDoingActivity = false;
+        if (idleTween) idleTween.resume();
+      },
+    });
+  }
+
+  // Activity: Stretch (grow taller briefly)
+  private activityStretch(
+    sprite: Phaser.GameObjects.Sprite,
+    baseY: number,
+    idleTween: Phaser.Tweens.Tween | null
+  ): void {
+    const baseScaleY = sprite.scaleY;
+
+    this.tweens.chain({
+      targets: sprite,
+      tweens: [
+        { scaleY: baseScaleY * 1.15, y: baseY - 5, duration: 400, ease: "Sine.easeOut" },
+        { scaleY: baseScaleY * 1.15, y: baseY - 5, duration: 300 }, // Hold stretch
+        { scaleY: baseScaleY, y: baseY, duration: 300, ease: "Sine.easeIn" },
+      ],
+      onComplete: () => {
+        sprite.setY(baseY);
+        (sprite as any).isDoingActivity = false;
+        if (idleTween) idleTween.resume();
+      },
+    });
+  }
+
+  // Activity: Nod (quick up-down motion like agreeing)
+  private activityNod(
+    sprite: Phaser.GameObjects.Sprite,
+    baseY: number,
+    idleTween: Phaser.Tweens.Tween | null
+  ): void {
+    this.tweens.chain({
+      targets: sprite,
+      tweens: [
+        { y: baseY + 3, duration: 100, ease: "Quad.easeIn" },
+        { y: baseY - 2, duration: 100, ease: "Quad.easeOut" },
+        { y: baseY + 2, duration: 80, ease: "Quad.easeIn" },
+        { y: baseY, duration: 80, ease: "Quad.easeOut" },
+      ],
+      onComplete: () => {
+        sprite.setY(baseY);
+        (sprite as any).isDoingActivity = false;
+        if (idleTween) idleTween.resume();
+      },
+    });
+  }
+
+  // Find a walk target that avoids other characters (prevents clumping)
+  private findSpacedWalkTarget(
+    sprite: Phaser.GameObjects.Sprite,
+    minX: number,
+    maxX: number
+  ): number {
+    const currentX = sprite.x;
+    const myId = (sprite as any).characterId;
+    const MIN_SPACING = 50; // Minimum pixels between characters
+
+    // Find all nearby character positions
+    const nearbyPositions: number[] = [];
+    this.characterSprites.forEach((otherSprite, id) => {
+      if (id === myId || !otherSprite.active || !otherSprite.visible) return;
+      const dist = Math.abs(otherSprite.x - currentX);
+      if (dist < 200) {
+        // Only consider characters within 200px
+        nearbyPositions.push(otherSprite.x);
+      }
+    });
+
+    // If no one nearby, pick random target
+    if (nearbyPositions.length === 0) {
+      return minX + Math.random() * (maxX - minX);
+    }
+
+    // Try to find a target that maintains spacing from others
+    // Strategy: sample several candidates and pick the one with best spacing
+    let bestTarget = currentX;
+    let bestMinDist = 0;
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = minX + Math.random() * (maxX - minX);
+
+      // Calculate minimum distance to any other character at this target
+      let minDistToOthers = Infinity;
+      for (const otherX of nearbyPositions) {
+        const dist = Math.abs(candidate - otherX);
+        if (dist < minDistToOthers) {
+          minDistToOthers = dist;
+        }
+      }
+
+      // If this candidate has better spacing, use it
+      if (minDistToOthers > bestMinDist) {
+        bestMinDist = minDistToOthers;
+        bestTarget = candidate;
+      }
+    }
+
+    // If even the best target is too close, move away from the crowd
+    if (bestMinDist < MIN_SPACING) {
+      // Find average position of nearby characters
+      const avgX = nearbyPositions.reduce((a, b) => a + b, 0) / nearbyPositions.length;
+
+      // Move away from the crowd
+      if (avgX > currentX) {
+        // Crowd is to the right, move left
+        bestTarget = Math.max(minX, currentX - 60 - Math.random() * 40);
+      } else {
+        // Crowd is to the left, move right
+        bestTarget = Math.min(maxX, currentX + 60 + Math.random() * 40);
+      }
+    }
+
+    return bestTarget;
+  }
+
+  private walkCharacter(
+    sprite: Phaser.GameObjects.Sprite,
+    minX: number,
+    maxX: number,
+    baseY: number,
+    speed: number,
+    isSpecial: boolean
+  ): void {
+    if (!sprite.active) return;
+
+    (sprite as any).isWalking = true;
+
+    // Pick a destination that avoids clumping with other characters
+    const currentX = sprite.x;
+    const targetX = this.findSpacedWalkTarget(sprite, minX, maxX);
+    const distance = Math.abs(targetX - currentX);
+
+    // Flip sprite based on direction
+    const goingRight = targetX > currentX;
+    sprite.setFlipX(!goingRight);
+
+    // Stop idle bounce while walking
+    const idleTween = (sprite as any).idleTween as Phaser.Tweens.Tween;
+    if (idleTween) {
+      idleTween.pause();
+    }
+
+    // Step-based walking: each step moves a fixed distance with hop animation
+    const stepSize = isSpecial ? 12 : 16; // Pixels per step
+    const stepDuration = isSpecial ? 280 : 220; // Ms per step (slower = more deliberate)
+    const numSteps = Math.max(2, Math.floor(distance / stepSize));
+    const actualStepSize = distance / numSteps;
+    const direction = goingRight ? 1 : -1;
+
+    let currentStep = 0;
+    const baseScaleX = sprite.scaleX;
+    const baseScaleY = sprite.scaleY;
+
+    // Update glow + shadow helper. Shadow x tracks the sprite, but shadow y is
+    // locked to baseY (the ground) so the character hops while the shadow
+    // stays planted — much more convincing than a shadow that bobs.
+    const updateGlow = () => {
+      GLOW_KEYS.forEach((key) => {
+        const glow = (sprite as any)[key];
+        if (glow && glow.active) {
+          glow.setX(sprite.x);
+        }
+      });
+      const shadow = (sprite as any)._shadow as Phaser.GameObjects.Sprite | undefined;
+      if (shadow && shadow.active) {
+        const offsetY = (sprite as any)._shadowFeetOffsetY ?? 0;
+        shadow.x = sprite.x;
+        shadow.y = baseY + offsetY;
+      }
+    };
+
+    // Take one step with hop animation
+    const takeStep = () => {
+      if (!sprite.active || currentStep >= numSteps) {
+        // Walking complete
+        (sprite as any).isWalking = false;
+        sprite.setY(baseY);
+        sprite.setAngle(0);
+        sprite.setScale(baseScaleX, baseScaleY);
+        if (idleTween) idleTween.resume();
+        updateGlow();
+        return;
+      }
+
+      const nextX = sprite.x + actualStepSize * direction;
+      const isLeftFoot = currentStep % 2 === 0;
+
+      // Each step: lift (hop up + tilt) -> land (drop + squash) -> recover
+      this.tweens.chain({
+        targets: sprite,
+        tweens: [
+          // Lift phase: hop up, slight tilt, move halfway
+          {
+            x: sprite.x + actualStepSize * direction * 0.5,
+            y: baseY - 6,
+            angle: isLeftFoot ? 3 : -3,
+            scaleX: baseScaleX * 0.98,
+            scaleY: baseScaleY * 1.04,
+            duration: stepDuration * 0.4,
+            ease: "Quad.easeOut",
+            onUpdate: updateGlow,
+          },
+          // Land phase: drop down, squash, complete the step
+          {
+            x: nextX,
+            y: baseY + 2,
+            angle: 0,
+            scaleX: baseScaleX * 1.04,
+            scaleY: baseScaleY * 0.96,
+            duration: stepDuration * 0.35,
+            ease: "Quad.easeIn",
+            onUpdate: updateGlow,
+          },
+          // Recover phase: return to normal
+          {
+            y: baseY,
+            scaleX: baseScaleX,
+            scaleY: baseScaleY,
+            duration: stepDuration * 0.25,
+            ease: "Sine.easeOut",
+          },
+        ],
+        onComplete: () => {
+          currentStep++;
+          takeStep(); // Next step
+        },
+      });
+    };
+
+    // Start walking
+    takeStep();
+  }
+
+  // === NPC AWARENESS ===
+
+  private triggerNPCGreeting(character: GameCharacter): void {
+    const now = Date.now();
+
+    // Suppress greetings shortly after zone entry
+    if (now - this.npcGreetZoneEntryTime < this.NPC_GREET_ZONE_GRACE_MS) return;
+
+    // Global cooldown: only one NPC greeting at a time
+    if (now - this.lastNpcGreetTime < this.GLOBAL_NPC_GREET_COOLDOWN_MS) return;
+
+    const behaviorId = this.getCharacterBehaviorId(character);
+    if (!behaviorId) return;
+
+    // Per-NPC cooldown
+    const lastGreet = this.npcGreetCooldowns.get(behaviorId) ?? 0;
+    if (now - lastGreet < this.NPC_GREET_COOLDOWN_MS) return;
+
+    const sprite = this.findCharacterSprite(behaviorId);
+    if (!sprite || !sprite.active) return;
+
+    // Skip if already doing something
+    if ((sprite as any).isDoingActivity || (sprite as any).isWalking) return;
+
+    // Set cooldowns
+    this.npcGreetCooldowns.set(behaviorId, now);
+    this.lastNpcGreetTime = now;
+
+    // Face the player
+    if (this.localPlayer) {
+      sprite.setFlipX(this.localPlayer.x < sprite.x);
+    }
+
+    // Mark as busy
+    (sprite as any).isDoingActivity = true;
+
+    // Get idle tween to pause it
+    const idleTween = (sprite as any).idleTween as Phaser.Tweens.Tween | null;
+    if (idleTween) idleTween.pause();
+
+    const baseY = (sprite as any).baseY ?? sprite.y;
+
+    // Wave animation (reuse existing pattern)
+    this.activityWave(sprite, baseY, null, this.localPlayer);
+
+    // Show greeting bubble
+    const greeting = this.getNPCGreeting(behaviorId);
+    window.dispatchEvent(
+      new CustomEvent("agencity-character-speak", {
+        detail: { characterId: behaviorId, message: greeting, emotion: "happy" },
+      })
+    );
+
+    // Hold NPC still for 3.5s (speech bubble display duration)
+    this.time.delayedCall(3500, () => {
+      (sprite as any).isDoingActivity = false;
+      if (idleTween) idleTween.resume();
+    });
+  }
+
+  private getNPCGreeting(characterId: string): string {
+    const greetings: Record<string, string[]> = {
+      finn: [
+        "Hey! Welcome to AgenCity!",
+        "Yo, nice to see you here!",
+        "The vibes are immaculate today!",
+      ],
+      ghost: ["Sup, legend. Stay ghostly.", "Welcome back, fren.", "Bags up, always."],
+      neo: [
+        "*scanning*... New launch detected: YOU!",
+        "Tracking your moves... impressive.",
+        "Welcome, builder.",
+      ],
+      ash: ["A new trainer approaches!", "Gotta catch 'em all, right?", "Ready for an adventure?"],
+      toly: ["Building on Solana? Based.", "Welcome, anon. Ship fast.", "The future is onchain."],
+      shaw: [
+        "Agents are the future.",
+        "Welcome to the swarm.",
+        "Let's build something autonomous.",
+      ],
+      cj: ["Yo, what's good homie!", "Welcome to the block!", "Big things happening, stay sharp!"],
+      ramo: ["The smart contracts are ready.", "Welcome, developer.", "Let's ship some code."],
+      sincara: ["The UI is looking clean!", "Hey there, pixel friend!", "Welcome to the frontend!"],
+      stuu: ["Need help? I got you!", "Welcome aboard!", "Operations running smooth!"],
+      sam: ["Let's grow this thing!", "Hey, welcome!", "Spreading the word!"],
+      alaa: ["Research lab is open!", "Something experimental today?", "Welcome to Skunk Works!"],
+      carlo: ["Welcome, ambassador!", "Great to have you here!", "Community first, always!"],
+      bnn: [
+        "Breaking: New visitor spotted!",
+        "Welcome! News at 11.",
+        "Reporting live from AgenCity!",
+      ],
+      professorOak: [
+        "Ah, a new trainer!",
+        "Ready to launch your first token?",
+        "The world awaits, young one!",
+      ],
+      citybot: ["HYPE! Welcome fren!", "LFG! Bags are pumping!", "The vibes are IMMACULATE!"],
+    };
+
+    const options = greetings[characterId] ?? ["Hey there!", "Welcome!", "Nice to see you!"];
+    return options[Math.floor(Math.random() * options.length)];
+  }
+
+  // === WILD ENCOUNTER SYSTEM ===
+
+  private checkCreatureEncounters(): void {
+    if (!this.localPlayer || this.encounterActive) return;
+
+    const now = Date.now();
+
+    // Global cooldown — no encounters too close together regardless of creature
+    if (now - this.lastGlobalEncounter < this.GLOBAL_ENCOUNTER_COOLDOWN_MS) return;
+
+    const px = this.localPlayer.x;
+    const py = this.localPlayer.y;
+
+    // Determine which creature arrays to check based on current zone
+    type EncounterTarget = {
+      sprite: Phaser.GameObjects.Sprite;
+      id: string;
+      zone: "main_city" | "founders" | "moltbook";
+    };
+    const targets: EncounterTarget[] = [];
+
+    if (this.currentZone === "main_city") {
+      this.animals.forEach((a, i) => {
+        targets.push({ sprite: a.sprite, id: `animal_${i}`, zone: "main_city" });
+      });
+    } else if (this.currentZone === "founders") {
+      this.pokemon.forEach((p, i) => {
+        targets.push({ sprite: p.sprite, id: `pokemon_${i}`, zone: "founders" });
+      });
+    } else if (this.currentZone === "moltbook") {
+      this.ambientCreatures.forEach((c, i) => {
+        targets.push({ sprite: c.sprite, id: `ambient_${i}`, zone: "moltbook" });
+      });
+    }
+
+    for (const target of targets) {
+      if (!target.sprite.active || !target.sprite.visible) continue;
+
+      const dist = Phaser.Math.Distance.Between(px, py, target.sprite.x, target.sprite.y);
+      if (dist > this.ENCOUNTER_RADIUS) continue;
+
+      // Check cooldown
+      const lastEncounter = this.encounterCooldowns.get(target.id) ?? 0;
+      if (now - lastEncounter < this.ENCOUNTER_COOLDOWN_MS) continue;
+
+      // Roll for encounter
+      if (Math.random() > this.ENCOUNTER_CHANCE) {
+        // Short-circuit cooldown on failed roll (15s) to avoid per-frame re-rolling
+        this.encounterCooldowns.set(target.id, now - this.ENCOUNTER_COOLDOWN_MS + 15000);
+        continue;
+      }
+
+      // Encounter triggered!
+      this.playEncounterSfx();
+      this.encounterCooldowns.set(target.id, now);
+      this.lastGlobalEncounter = now;
+      this.encounterActive = true;
+
+      // Safety timeout: if overlay crashes without dispatching encounter-end,
+      // reset encounterActive so future encounters aren't permanently blocked
+      if (this.encounterActiveTimeout) clearTimeout(this.encounterActiveTimeout);
+      this.encounterActiveTimeout = setTimeout(() => {
+        if (this.encounterActive) {
+          this.encounterActive = false;
+        }
+      }, this.ENCOUNTER_MAX_DURATION_MS);
+
+      window.dispatchEvent(
+        new CustomEvent("agencity-encounter-start", {
+          detail: { zone: target.zone },
+        })
+      );
+      break; // Only one encounter at a time
+    }
+  }
+
+  private handleEncounterEnd(event: CustomEvent): void {
+    this.encounterActive = false;
+    if (this.encounterActiveTimeout) {
+      clearTimeout(this.encounterActiveTimeout);
+      this.encounterActiveTimeout = null;
+    }
+    const result = event.detail?.result as string;
+
+    if (result === "lose") {
+      this.showPlayerStunEffect();
+    }
+  }
+
+  private showPlayerStunEffect(): void {
+    if (!this.localPlayer) return;
+
+    this.playerStunned = true;
+
+    // Create 3 orbiting star emojis above the player
+    const starOffsets = [0, (Math.PI * 2) / 3, (Math.PI * 4) / 3];
+    const starTexts: Phaser.GameObjects.Text[] = [];
+
+    for (const offset of starOffsets) {
+      const star = this.add.text(this.localPlayer.x, this.localPlayer.y - 40, "*", {
+        fontSize: "16px",
+        color: "#FFD700",
+        fontFamily: "monospace",
+      });
+      star.setOrigin(0.5);
+      star.setDepth(20);
+      starTexts.push(star);
+    }
+
+    this.stunStars = starTexts;
+
+    // Animate stars orbiting
+    let angle = 0;
+    const orbitRadius = 15;
+    const orbitTimer = this.time.addEvent({
+      delay: 30,
+      loop: true,
+      callback: () => {
+        if (!this.localPlayer) return;
+        angle += 0.08;
+        starTexts.forEach((star, i) => {
+          const a = angle + starOffsets[i];
+          star.setPosition(
+            this.localPlayer!.x + Math.cos(a) * orbitRadius,
+            this.localPlayer!.y - 40 + Math.sin(a) * 5
+          );
+        });
+      },
+    });
+
+    // Remove stun after 3s
+    this.time.delayedCall(3000, () => {
+      this.playerStunned = false;
+      orbitTimer.destroy();
+      starTexts.forEach((s) => s.destroy());
+      this.stunStars = [];
+    });
+  }
+}
