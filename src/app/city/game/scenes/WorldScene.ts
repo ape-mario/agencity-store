@@ -20,6 +20,7 @@ import { SkySystem } from "../systems/SkySystem";
 import { DecorationSystem } from "../systems/DecorationSystem";
 import { CharacterSystem } from "../systems/CharacterSystem";
 import { BuildingSystem } from "../systems/BuildingSystem";
+import { EncounterSystem } from "../systems/EncounterSystem";
 import {
   setupTrendingZone,
   clearTrafficTimers,
@@ -154,6 +155,9 @@ export class WorldScene extends Phaser.Scene {
 
   /** Building sprite lifecycle: create, update, decay visuals, dormant state. */
   public buildingSystem: BuildingSystem = new BuildingSystem(this);
+
+  /** Wild-creature encounter trigger + cooldown + stun glue. */
+  public encounterSystem: EncounterSystem = new EncounterSystem(this);
 
   /** Sky gradient, stars, time-of-day palette, sun/moon, weather effects.
    *  Constructed in create() once the day/night overlay exists. */
@@ -325,18 +329,8 @@ export class WorldScene extends Phaser.Scene {
   public npcGreetZoneEntryTime = 0; // suppress greetings for 5s after zone entry
   public readonly NPC_GREET_ZONE_GRACE_MS = 5000;
 
-  // Wild Encounter system
-  private encounterCooldowns: Map<string, number> = new Map();
-  private readonly ENCOUNTER_COOLDOWN_MS = 90000;
-  private readonly ENCOUNTER_RADIUS = 50;
-  private readonly ENCOUNTER_CHANCE = 0.08;
-  private lastGlobalEncounter = Date.now(); // Grace period: no encounters on first load
-  private readonly GLOBAL_ENCOUNTER_COOLDOWN_MS = 45000;
-  private encounterActive = false;
-  private encounterActiveTimeout: ReturnType<typeof setTimeout> | null = null;
-  private readonly ENCOUNTER_MAX_DURATION_MS = 300000; // 5 min safety timeout
-  private playerStunned = false;
-  private stunStars: Phaser.GameObjects.Text[] = [];
+  // Wild Encounter system state now lives in EncounterSystem; only the window
+  // listener binding is tracked here for cleanup.
   private boundEncounterEnd: ((e: Event) => void) | null = null;
   private boundEnterWorld: ((e: Event) => void) | null = null;
   private boundExitWorld: ((e: Event) => void) | null = null;
@@ -452,7 +446,7 @@ export class WorldScene extends Phaser.Scene {
     window.addEventListener("agencity-character-speak", this.boundSpeakHandler);
 
     // Listen for encounter end events (from React overlay)
-    this.boundEncounterEnd = (e: Event) => this.handleEncounterEnd(e as CustomEvent);
+    this.boundEncounterEnd = (e: Event) => this.encounterSystem.handleEncounterEnd(e as CustomEvent);
     window.addEventListener("agencity-encounter-end", this.boundEncounterEnd);
 
     // Setup local player controls (WASD/arrow keys to walk around)
@@ -1070,7 +1064,7 @@ export class WorldScene extends Phaser.Scene {
       if (this.wasDragGesture) return;
       if ((window as any).__agencity_modal_open) return;
       if (this.isTransitioning) return;
-      if (this.encounterActive) return;
+      if (this.encounterSystem.encounterActive) return;
       if (this.tapMoveSuppressed) return;
 
       // Long-press to sprint: any press held >= LONG_PRESS_SPRINT_MS releases as sprint
@@ -1292,7 +1286,7 @@ export class WorldScene extends Phaser.Scene {
     if ((window as any).__agencity_modal_open) return;
 
     // Skip movement when stunned (after encounter loss) or in encounter
-    if (this.playerStunned || this.encounterActive) return;
+    if (this.encounterSystem.playerStunned || this.encounterSystem.encounterActive) return;
 
     // Skip WASD movement when a text input or textarea is focused (chat boxes, modals, etc.)
     const activeTag = document.activeElement?.tagName;
@@ -1473,7 +1467,7 @@ export class WorldScene extends Phaser.Scene {
     this.checkProximityForInteraction();
 
     // Check for wild creature encounters
-    this.checkCreatureEncounters();
+    this.encounterSystem.checkCreatureEncounters();
 
     // Handle E key interaction (NPCs take priority over helper, helper over buildings)
     if (interact) {
@@ -3440,16 +3434,12 @@ export class WorldScene extends Phaser.Scene {
 
     // Phase 0 memory-leak sweep: encounter/tooltip timers that were stored but
     // not previously torn down on shutdown.
-    if (this.encounterActiveTimeout) {
-      clearTimeout(this.encounterActiveTimeout);
-      this.encounterActiveTimeout = null;
-    }
+    // Tear down encounter safety-timeout + clear active/stun state.
+    this.encounterSystem.cleanup();
     // Tear down any open tooltip + pending hide timer.
     this.tooltipSystem.cleanup();
     // Tear down announcement banner + any lingering effect state.
     this.eventEffectSystem.cleanup();
-    this.encounterActive = false;
-    this.playerStunned = false;
 
     // Clean up speech bubble manager
     if (this.speechBubbleManager) {
@@ -4258,140 +4248,4 @@ export class WorldScene extends Phaser.Scene {
 
   // === WILD ENCOUNTER SYSTEM ===
 
-  private checkCreatureEncounters(): void {
-    if (!this.localPlayer || this.encounterActive) return;
-
-    const now = Date.now();
-
-    // Global cooldown — no encounters too close together regardless of creature
-    if (now - this.lastGlobalEncounter < this.GLOBAL_ENCOUNTER_COOLDOWN_MS) return;
-
-    const px = this.localPlayer.x;
-    const py = this.localPlayer.y;
-
-    // Determine which creature arrays to check based on current zone
-    type EncounterTarget = {
-      sprite: Phaser.GameObjects.Sprite;
-      id: string;
-      zone: "main_city" | "founders" | "moltbook";
-    };
-    const targets: EncounterTarget[] = [];
-
-    if (this.currentZone === "main_city") {
-      this.animals.forEach((a, i) => {
-        targets.push({ sprite: a.sprite, id: `animal_${i}`, zone: "main_city" });
-      });
-    } else if (this.currentZone === "founders") {
-      this.pokemon.forEach((p, i) => {
-        targets.push({ sprite: p.sprite, id: `pokemon_${i}`, zone: "founders" });
-      });
-    } else if (this.currentZone === "moltbook") {
-      this.ambientCreatures.forEach((c, i) => {
-        targets.push({ sprite: c.sprite, id: `ambient_${i}`, zone: "moltbook" });
-      });
-    }
-
-    for (const target of targets) {
-      if (!target.sprite.active || !target.sprite.visible) continue;
-
-      const dist = Phaser.Math.Distance.Between(px, py, target.sprite.x, target.sprite.y);
-      if (dist > this.ENCOUNTER_RADIUS) continue;
-
-      // Check cooldown
-      const lastEncounter = this.encounterCooldowns.get(target.id) ?? 0;
-      if (now - lastEncounter < this.ENCOUNTER_COOLDOWN_MS) continue;
-
-      // Roll for encounter
-      if (Math.random() > this.ENCOUNTER_CHANCE) {
-        // Short-circuit cooldown on failed roll (15s) to avoid per-frame re-rolling
-        this.encounterCooldowns.set(target.id, now - this.ENCOUNTER_COOLDOWN_MS + 15000);
-        continue;
-      }
-
-      // Encounter triggered!
-      this.audioSystem.playEncounterSfx();
-      this.encounterCooldowns.set(target.id, now);
-      this.lastGlobalEncounter = now;
-      this.encounterActive = true;
-
-      // Safety timeout: if overlay crashes without dispatching encounter-end,
-      // reset encounterActive so future encounters aren't permanently blocked
-      if (this.encounterActiveTimeout) clearTimeout(this.encounterActiveTimeout);
-      this.encounterActiveTimeout = setTimeout(() => {
-        if (this.encounterActive) {
-          this.encounterActive = false;
-        }
-      }, this.ENCOUNTER_MAX_DURATION_MS);
-
-      window.dispatchEvent(
-        new CustomEvent("agencity-encounter-start", {
-          detail: { zone: target.zone },
-        })
-      );
-      break; // Only one encounter at a time
-    }
-  }
-
-  private handleEncounterEnd(event: CustomEvent): void {
-    this.encounterActive = false;
-    if (this.encounterActiveTimeout) {
-      clearTimeout(this.encounterActiveTimeout);
-      this.encounterActiveTimeout = null;
-    }
-    const result = event.detail?.result as string;
-
-    if (result === "lose") {
-      this.showPlayerStunEffect();
-    }
-  }
-
-  private showPlayerStunEffect(): void {
-    if (!this.localPlayer) return;
-
-    this.playerStunned = true;
-
-    // Create 3 orbiting star emojis above the player
-    const starOffsets = [0, (Math.PI * 2) / 3, (Math.PI * 4) / 3];
-    const starTexts: Phaser.GameObjects.Text[] = [];
-
-    for (const offset of starOffsets) {
-      const star = this.add.text(this.localPlayer.x, this.localPlayer.y - 40, "*", {
-        fontSize: "16px",
-        color: "#FFD700",
-        fontFamily: "monospace",
-      });
-      star.setOrigin(0.5);
-      star.setDepth(20);
-      starTexts.push(star);
-    }
-
-    this.stunStars = starTexts;
-
-    // Animate stars orbiting
-    let angle = 0;
-    const orbitRadius = 15;
-    const orbitTimer = this.time.addEvent({
-      delay: 30,
-      loop: true,
-      callback: () => {
-        if (!this.localPlayer) return;
-        angle += 0.08;
-        starTexts.forEach((star, i) => {
-          const a = angle + starOffsets[i];
-          star.setPosition(
-            this.localPlayer!.x + Math.cos(a) * orbitRadius,
-            this.localPlayer!.y - 40 + Math.sin(a) * 5
-          );
-        });
-      },
-    });
-
-    // Remove stun after 3s
-    this.time.delayedCall(3000, () => {
-      this.playerStunned = false;
-      orbitTimer.destroy();
-      starTexts.forEach((s) => s.destroy());
-      this.stunStars = [];
-    });
-  }
 }
