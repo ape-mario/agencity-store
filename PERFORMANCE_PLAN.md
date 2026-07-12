@@ -2,9 +2,9 @@
 
 ## Implementation status
 
-Phases 0, 1, 2, and most of 3 are **implemented and verified** (typecheck +
-build clean; 63 vitest tests pass, 53 new). `WorldScene.ts` dropped from
-**10,295 → 3,788 lines** (−63%), with 10 systems extracted under
+Phases 0–3 are **implemented and verified** (typecheck + build clean; 74 vitest
+tests pass, 64 new; e2e smoke test passes). `WorldScene.ts` dropped from
+**10,295 → 1,597 lines** (−84.5%), with all 12 systems extracted under
 `src/app/city/game/systems/`:
 
 | Phase | System | Status | Notes |
@@ -24,20 +24,21 @@ build clean; 63 vitest tests pass, 53 new). `WorldScene.ts` dropped from
 | 3 | `AgentSystem` | ✅ | agent-WebSocket glue: connect, world-state poll, command translation |
 | 3 | `CameraSystem` | ✅ | mobile drag/pan/zoom + tap-vs-drag detection |
 | 3 | `ZoneSystem` | ✅ | zone transitions, setup/clear, offscreen caching, popup-building registry |
-| 3 | `PlayerSystem` | ⏳ remaining | local player input, enter/exit world, tap-to-move, spawn/iris, E-key |
+| 3 | `PlayerSystem` | ✅ | local player input, enter/exit world, tap-to-move, spawn/iris, E-key, helper NPC, tutorial |
 
 ### Remaining work
 
-`PlayerSystem` and `ZoneSystem` are the scene's core coordination layer — they
-share ~40 fields with each other, the `update()` loop, the input handlers, and
-the React bridge. They are the highest-risk extractions (interactive movement +
-zone-transition timing with no e2e coverage). A methods-bundle extraction is
-mechanically possible but provides limited decoupling since the systems would
-still reach through the scene for nearly all state; the real win requires the
-shared state to move with the methods, which means touching every call site.
+All 12 systems from the plan are now extracted (Phases 0–3 complete).
+`WorldScene.ts` is a **1,597-line coordinator** — essentially the plan's
+~1,500-line target (84.5% below the original 10,295). PlayerSystem and
+ZoneSystem were extracted as methods-bundles: the input/movement/zone-*logic*
+moved into the systems, while the shared coordination fields (localPlayer,
+currentZone, isTransitioning, the zone-element arrays, etc.) stay on the scene
+because zone files, the update loop, cleanup, and the React bridge read them
+directly. The state-ownership map below documents the split.
 
 Phase 4 (zone lazy loading, object pooling) and Phase 5 (bundle analyzer,
-phaser chunking) are independent of the remaining extractions and can proceed
+phaser chunking) are the remaining independent optimizations and can proceed
 on their own.
 
 ### Execution plan for PlayerSystem + ZoneSystem
