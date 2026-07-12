@@ -13,6 +13,9 @@ import type { DialogueLine } from "@/city/lib/autonomous-dialogue";
 import { getCurrentLine, getActiveConversation } from "@/city/lib/autonomous-dialogue";
 import { useGameStore } from "@/city/lib/store";
 import { SCALE, DEPTH, Y } from "../textures/constants";
+import { AudioSystem } from "../systems/AudioSystem";
+import { TooltipSystem } from "../systems/TooltipSystem";
+import { EventEffectSystem } from "../systems/EventEffectSystem";
 import {
   setupTrendingZone,
   clearTrafficTimers,
@@ -126,33 +129,28 @@ export class WorldScene extends Phaser.Scene {
   public skyClouds: Phaser.GameObjects.Ellipse[] = [];
   public treeline: Phaser.GameObjects.Graphics | null = null;
   private skyTimeState: "day" | "night" | "dusk" | "dawn" = "night";
-  private musicPlaying = false;
-  public audioContext: AudioContext | null = null;
-  public gainNode: GainNode | null = null;
-  private musicInterval: number | null = null;
-  private activeOscillators: OscillatorNode[] = []; // Track active oscillators to stop on track switch
-  private currentTrack = 0;
-  private trackNames = [
-    "Adventure",
-    "Bags Anthem",
-    "Night Market",
-    "Victory March",
-    "Route 101",
-    "Pokemon Center",
-    "Mystery Dungeon",
-  ];
+
+  /** Procedural music + SFX. Owns the shared AudioContext/GainNode. */
+  public audioSystem: AudioSystem = new AudioSystem(this);
+  // Back-compat getters so zone files (arena.ts) that reach for the shared
+  // audio context keep compiling without referencing private state.
+  public get audioContext(): AudioContext | null {
+    return this.audioSystem.context;
+  }
+  public get gainNode(): GainNode | null {
+    return this.audioSystem.masterGain;
+  }
+
+  /** Character + building hover tooltips. */
+  public tooltipSystem: TooltipSystem = new TooltipSystem(this);
+
+  /** Celebrations, fireworks, coin rain, announcements, bot-effect dispatch. */
+  public eventEffectSystem: EventEffectSystem = new EventEffectSystem(this);
 
   // Store bound event handlers for cleanup
-  private boundToggleMusic: (() => void) | null = null;
-  private boundSkipTrack: (() => void) | null = null;
-  private boundPrevTrack: (() => void) | null = null;
   private boundBotEffect: ((e: Event) => void) | null = null;
   private boundBotAnimal: ((e: Event) => void) | null = null;
   private boundBotPokemon: ((e: Event) => void) | null = null;
-
-  // Announcement text object
-  private announcementText: Phaser.GameObjects.Text | null = null;
-  private announcementBg: Phaser.GameObjects.Rectangle | null = null;
 
   // Zone system
   public currentZone: ZoneType = "main_city";
@@ -307,6 +305,7 @@ export class WorldScene extends Phaser.Scene {
   private boundEncounterEnd: ((e: Event) => void) | null = null;
   private boundEnterWorld: ((e: Event) => void) | null = null;
   private boundExitWorld: ((e: Event) => void) | null = null;
+  private boundTutorialStep: ((e: Event) => void) | null = null;
   private pendingEnterWorld: (() => void) | null = null; // Queued spawn when zone is transitioning
 
   public isMobile = false;
@@ -318,7 +317,7 @@ export class WorldScene extends Phaser.Scene {
   // Drag detection: prevents accidental taps when scrolling on mobile
   private touchStartPos: { x: number; y: number } | null = null;
   private touchStartTime = 0; // Timestamp of last pointerdown — used to detect long-press sprint
-  private wasDragGesture = false;
+  public wasDragGesture = false; // public: TooltipSystem reads it to suppress profile opens after a drag
   private static readonly TAP_DISTANCE_THRESHOLD = 12; // pixels
   private static readonly LONG_PRESS_SPRINT_MS = 250; // Hold this long to sprint on release
 
@@ -386,23 +385,11 @@ export class WorldScene extends Phaser.Scene {
       ease: "Linear",
     });
 
-    // Start background music
-    this.startPokemonMusic();
-
-    // Listen for music toggle (store bound handler for cleanup)
-    this.boundToggleMusic = () => this.toggleMusic();
-    window.addEventListener("agencity-toggle-music", this.boundToggleMusic);
-
-    // Listen for track skip (store bound handler for cleanup)
-    this.boundSkipTrack = () => this.skipTrack();
-    window.addEventListener("agencity-skip-track", this.boundSkipTrack);
-
-    // Listen for previous track (store bound handler for cleanup)
-    this.boundPrevTrack = () => this.prevTrack();
-    window.addEventListener("agencity-prev-track", this.boundPrevTrack);
+    // Start background music + register music-control listeners
+    this.audioSystem.init();
 
     // Listen for bot effect commands
-    this.boundBotEffect = (e: Event) => this.handleBotEffect(e as CustomEvent);
+    this.boundBotEffect = (e: Event) => this.eventEffectSystem.handleBotEffect(e as CustomEvent);
     window.addEventListener("agencity-bot-effect", this.boundBotEffect);
 
     // Listen for bot animal commands
@@ -796,7 +783,7 @@ export class WorldScene extends Phaser.Scene {
     if (!this.localPlayer) return;
 
     // Play entry sound effect
-    this.playSpawnSfx();
+    this.audioSystem.playSpawnSfx();
 
     // Play iris-in reveal
     this.playIrisIn(x, y);
@@ -918,7 +905,7 @@ export class WorldScene extends Phaser.Scene {
     this.disableTapToMove();
 
     // Play exit sound
-    this.playExitSfx();
+    this.audioSystem.playExitSfx();
 
     // Stop camera follow and zoom back to overview
     if (this.cameraFollowing) {
@@ -1472,7 +1459,9 @@ export class WorldScene extends Phaser.Scene {
   private tutorialArrows: Phaser.GameObjects.Text[] = [];
 
   private initTutorialListener(): void {
-    window.addEventListener("agencity-tutorial-step", ((e: CustomEvent<{ step: number }>) => {
+    // Store the bound handler so it can be removed on shutdown (was previously
+    // an inline anonymous listener that leaked across scene re-mounts).
+    this.boundTutorialStep = ((e: CustomEvent<{ step: number }>) => {
       const prev = this.tutorialStep;
       this.tutorialStep = e.detail.step;
 
@@ -1485,7 +1474,8 @@ export class WorldScene extends Phaser.Scene {
       if (this.tutorialStep === 1 && prev !== 1) {
         this.showTutorialNpcArrows();
       }
-    }) as EventListener);
+    }) as EventListener;
+    window.addEventListener("agencity-tutorial-step", this.boundTutorialStep);
   }
 
   private showTutorialNpcArrows(): void {
@@ -1716,7 +1706,7 @@ export class WorldScene extends Phaser.Scene {
   }
 
   private interactWithNPC(character: GameCharacter): void {
-    this.playInteractSfx();
+    this.audioSystem.playInteractSfx();
 
     // Simulate the exact same click behavior as pointerdown handlers
     // This matches the logic in createCharacterSprite
@@ -1728,7 +1718,7 @@ export class WorldScene extends Phaser.Scene {
       // Show tooltip with "Visit Profile" button instead of navigating directly
       const sprite = this.characterSprites.get(character.id);
       if (sprite) {
-        this.showCharacterTooltip(character, sprite);
+        this.tooltipSystem.showCharacterTooltip(character, sprite);
       }
     } else if (character.isToly) {
       window.dispatchEvent(new CustomEvent("agencity-toly-click"));
@@ -1766,19 +1756,19 @@ export class WorldScene extends Phaser.Scene {
       // Show tooltip with "Visit Profile" button instead of navigating directly
       const sprite = this.characterSprites.get(character.id);
       if (sprite) {
-        this.showCharacterTooltip(character, sprite);
+        this.tooltipSystem.showCharacterTooltip(character, sprite);
       }
     }
   }
 
   private interactWithBuilding(building: GameBuilding): void {
-    this.playBuildingClickSfx();
+    this.audioSystem.playBuildingClickSfx();
 
     // Zone-specific popup buildings have their own click handlers registered
     // in zonePopupBuildings. Use that callback if available.
     const zonePopup = this.zonePopupBuildings.get(building.id);
     if (zonePopup) {
-      this.playBuildingClickBurst(zonePopup.sprite.x, zonePopup.sprite.y - 60);
+      this.audioSystem.playBuildingClickBurst(zonePopup.sprite.x, zonePopup.sprite.y - 60);
       zonePopup.onInteract();
       return;
     }
@@ -1791,7 +1781,7 @@ export class WorldScene extends Phaser.Scene {
       // Containers anchor at the bottom (origin 0.5, 1) — offset upward by
       // half the hitbox height (~60–100px) so the burst sits over the body
       // of the building, not at its feet.
-      this.playBuildingClickBurst(sprite.x, sprite.y - 60);
+      this.audioSystem.playBuildingClickBurst(sprite.x, sprite.y - 60);
     }
 
     // Simulate the exact same click behavior as building pointerdown handlers
@@ -2026,7 +2016,7 @@ export class WorldScene extends Phaser.Scene {
   }
 
   private transitionToZone(newZone: ZoneType): void {
-    this.playZoneTransitionSfx();
+    this.audioSystem.playZoneTransitionSfx();
 
     // Mark transition in progress and cancel any active tap-to-move
     this.isTransitioning = true;
@@ -3176,6 +3166,12 @@ export class WorldScene extends Phaser.Scene {
       return;
     }
 
+    // Phase 0: pause outbound world-state updates while a popup is open — no
+    // visible motion to report, and skipping saves a full sprite-scan + WS send.
+    if (typeof window !== "undefined" && (window as any).__agencity_modal_open === true) {
+      return;
+    }
+
     try {
       // Build character states from current sprites
       const characters: Record<string, { x: number; y: number; isMoving: boolean }> = {};
@@ -3319,19 +3315,10 @@ export class WorldScene extends Phaser.Scene {
     // Clean up tutorial
     this.clearTutorialArrows();
 
+    // Tear down audio (context, oscillators, loop timeout, control listeners).
+    this.audioSystem.cleanup();
+
     // Remove window event listeners
-    if (this.boundToggleMusic) {
-      window.removeEventListener("agencity-toggle-music", this.boundToggleMusic);
-      this.boundToggleMusic = null;
-    }
-    if (this.boundSkipTrack) {
-      window.removeEventListener("agencity-skip-track", this.boundSkipTrack);
-      this.boundSkipTrack = null;
-    }
-    if (this.boundPrevTrack) {
-      window.removeEventListener("agencity-prev-track", this.boundPrevTrack);
-      this.boundPrevTrack = null;
-    }
     if (this.boundBotEffect) {
       window.removeEventListener("agencity-bot-effect", this.boundBotEffect);
       this.boundBotEffect = null;
@@ -3359,6 +3346,10 @@ export class WorldScene extends Phaser.Scene {
     if (this.boundEKeyDown) {
       window.removeEventListener("keydown", this.boundEKeyDown);
       this.boundEKeyDown = null;
+    }
+    if (this.boundTutorialStep) {
+      window.removeEventListener("agencity-tutorial-step", this.boundTutorialStep);
+      this.boundTutorialStep = null;
     }
 
     // Clean up local player, drop shadow, and meme textures
@@ -3401,21 +3392,6 @@ export class WorldScene extends Phaser.Scene {
       this.interactPrompt = null;
     }
 
-    // Stop music and clean up audio context
-    if (this.musicInterval) {
-      clearTimeout(this.musicInterval);
-      this.musicInterval = null;
-    }
-    if (this.audioContext) {
-      this.stopAllOscillators();
-      if (this.gainNode) {
-        this.gainNode.disconnect();
-        this.gainNode = null;
-      }
-      this.audioContext.close();
-      this.audioContext = null;
-    }
-
     // Clean up zone-specific timers
     if (this.tickerTimer) {
       this.tickerTimer.destroy();
@@ -3426,6 +3402,27 @@ export class WorldScene extends Phaser.Scene {
       this.billboardTimer = null;
     }
     clearTrafficTimers(this);
+
+    // Phase 0 memory-leak sweep: weather/encounter/tooltip timers that were
+    // stored but not previously torn down on shutdown.
+    if (this.lightningTimer) {
+      this.lightningTimer.destroy();
+      this.lightningTimer = null;
+    }
+    if (this.apocalypseTimer) {
+      this.apocalypseTimer.destroy();
+      this.apocalypseTimer = null;
+    }
+    if (this.encounterActiveTimeout) {
+      clearTimeout(this.encounterActiveTimeout);
+      this.encounterActiveTimeout = null;
+    }
+    // Tear down any open tooltip + pending hide timer.
+    this.tooltipSystem.cleanup();
+    // Tear down announcement banner + any lingering effect state.
+    this.eventEffectSystem.cleanup();
+    this.encounterActive = false;
+    this.playerStunned = false;
 
     // Clean up speech bubble manager
     if (this.speechBubbleManager) {
@@ -3468,6 +3465,18 @@ export class WorldScene extends Phaser.Scene {
     // Clean up beach crabs and ambient creatures
     this.beachCrabs = [];
     this.ambientCreatures = [];
+
+    // Phase 0 memory-leak sweep: arena polling timer + replay listener are
+    // normally torn down by the arena zone's cleanup, but ensure they're gone
+    // if the scene shuts down while the arena zone is active.
+    if (this.arenaPollingTimer) {
+      this.arenaPollingTimer.destroy();
+      this.arenaPollingTimer = null;
+    }
+    if (this.arenaReplayCleanup) {
+      this.arenaReplayCleanup();
+      this.arenaReplayCleanup = null;
+    }
   }
 
   private createGround(): void {
@@ -4983,862 +4992,44 @@ export class WorldScene extends Phaser.Scene {
     }
   }
 
-  private startPokemonMusic(): void {
-    try {
-      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      this.gainNode = this.audioContext.createGain();
-      this.gainNode.connect(this.audioContext.destination);
-      this.gainNode.gain.value = 0.08; // Very low volume for ambient background
-
-      this.playCurrentTrack();
-      this.musicPlaying = true;
-      this.emitTrackChange();
-    } catch {
-      // Audio not supported
-    }
-  }
-
-  private emitTrackChange(): void {
-    window.dispatchEvent(
-      new CustomEvent("agencity-track-changed", {
-        detail: { trackName: this.trackNames[this.currentTrack], trackIndex: this.currentTrack },
-      })
-    );
-  }
-
-  private stopAllOscillators(): void {
-    // Stop all active oscillators immediately to prevent overlap
-    this.activeOscillators.forEach((osc) => {
-      try {
-        osc.stop();
-        osc.disconnect();
-      } catch {
-        // Oscillator may have already stopped
-      }
-    });
-    this.activeOscillators = [];
-  }
-
-  private playCurrentTrack(): void {
-    // Clear any existing scheduled track to prevent overlapping
-    if (this.musicInterval) {
-      clearTimeout(this.musicInterval);
-      this.musicInterval = null;
-    }
-
-    // Stop all currently playing oscillators
-    this.stopAllOscillators();
-
-    switch (this.currentTrack) {
-      case 0:
-        this.playPokemonMelody();
-        break;
-      case 1:
-        this.playBagsAnthem();
-        break;
-      case 2:
-        this.playNightMarket();
-        break;
-      case 3:
-        this.playVictoryMarch();
-        break;
-      case 4:
-        this.playRoute101();
-        break;
-      case 5:
-        this.playPokemonCenter();
-        break;
-      case 6:
-        this.playMysteryDungeon();
-        break;
-      default:
-        this.playPokemonMelody();
-    }
-  }
-
-  private skipTrack(): void {
-    // Stop current melody
-    if (this.musicInterval) {
-      clearTimeout(this.musicInterval);
-      this.musicInterval = null;
-    }
-
-    // Move to next track
-    this.currentTrack = (this.currentTrack + 1) % this.trackNames.length;
-    this.emitTrackChange();
-
-    // Play new track if music is on
-    if (this.musicPlaying && this.audioContext && this.gainNode) {
-      this.playCurrentTrack();
-    }
-  }
-
-  private prevTrack(): void {
-    // Stop current melody
-    if (this.musicInterval) {
-      clearTimeout(this.musicInterval);
-      this.musicInterval = null;
-    }
-
-    // Move to previous track (wrap around)
-    this.currentTrack = (this.currentTrack - 1 + this.trackNames.length) % this.trackNames.length;
-    this.emitTrackChange();
-
-    // Play new track if music is on
-    if (this.musicPlaying && this.audioContext && this.gainNode) {
-      this.playCurrentTrack();
-    }
-  }
-
-  private playPokemonMelody(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Ambient, relaxed pentatonic melody - much longer and less repetitive
-    // Slower tempo, longer notes, more space between phrases
-    const notes = [
-      // Phrase 1 - gentle opening
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 440.0, duration: 0.6 }, // A4
-      { freq: 523.25, duration: 1.0 }, // C5
-      { freq: 0, duration: 0.8 }, // Rest
-      { freq: 440.0, duration: 0.6 }, // A4
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 329.63, duration: 1.2 }, // E4
-      { freq: 0, duration: 1.0 }, // Long rest
-
-      // Phrase 2 - variation
-      { freq: 329.63, duration: 0.6 }, // E4
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 440.0, duration: 1.0 }, // A4
-      { freq: 0, duration: 0.6 }, // Rest
-      { freq: 523.25, duration: 0.8 }, // C5
-      { freq: 440.0, duration: 0.6 }, // A4
-      { freq: 392.0, duration: 1.2 }, // G4
-      { freq: 0, duration: 1.2 }, // Long rest
-
-      // Phrase 3 - descending
-      { freq: 523.25, duration: 0.8 }, // C5
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 329.63, duration: 1.0 }, // E4
-      { freq: 0, duration: 0.8 }, // Rest
-      { freq: 293.66, duration: 0.6 }, // D4
-      { freq: 261.63, duration: 1.4 }, // C4
-      { freq: 0, duration: 1.5 }, // Long rest
-
-      // Phrase 4 - resolution
-      { freq: 261.63, duration: 0.8 }, // C4
-      { freq: 329.63, duration: 0.6 }, // E4
-      { freq: 392.0, duration: 1.0 }, // G4
-      { freq: 0, duration: 0.5 }, // Rest
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 392.0, duration: 1.2 }, // G4
-      { freq: 0, duration: 2.0 }, // Very long rest before loop
-    ];
-
-    // Soft, sustained bass notes (much quieter)
-    const bass = [
-      { freq: 130.81, duration: 3.0 }, // C3
-      { freq: 0, duration: 1.0 },
-      { freq: 110.0, duration: 3.0 }, // A2
-      { freq: 0, duration: 1.0 },
-      { freq: 98.0, duration: 3.0 }, // G2
-      { freq: 0, duration: 1.0 },
-      { freq: 130.81, duration: 4.0 }, // C3
-      { freq: 0, duration: 2.0 },
-      { freq: 110.0, duration: 3.0 }, // A2
-      { freq: 0, duration: 1.5 },
-      { freq: 98.0, duration: 3.0 }, // G2
-      { freq: 0, duration: 2.5 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    // Play melody with sine waves
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.85, 0.08, "sine");
-      }
-      time += note.duration;
-    });
-
-    // Play bass with triangle waves (very quiet)
-    let bassTime = this.audioContext.currentTime + 0.1;
-    bass.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.04, "triangle");
-      }
-      bassTime += note.duration;
-    });
-
-    // Loop with extra pause
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  // Track 2: Bags Anthem - Gentle, uplifting
-  private playBagsAnthem(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Gentle uplifting melody - longer phrases, more space
-    const notes = [
-      { freq: 329.63, duration: 0.8 }, // E4
-      { freq: 392.0, duration: 0.6 }, // G4
-      { freq: 493.88, duration: 1.0 }, // B4
-      { freq: 0, duration: 0.6 }, // Rest
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 392.0, duration: 0.6 }, // G4
-      { freq: 329.63, duration: 1.2 }, // E4
-      { freq: 0, duration: 1.0 }, // Long rest
-
-      { freq: 392.0, duration: 0.6 }, // G4
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 493.88, duration: 0.8 }, // B4
-      { freq: 523.25, duration: 1.0 }, // C5
-      { freq: 0, duration: 0.8 }, // Rest
-      { freq: 493.88, duration: 0.6 }, // B4
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 392.0, duration: 1.2 }, // G4
-      { freq: 0, duration: 1.2 }, // Long rest
-
-      { freq: 329.63, duration: 0.8 }, // E4
-      { freq: 293.66, duration: 0.6 }, // D4
-      { freq: 329.63, duration: 1.0 }, // E4
-      { freq: 392.0, duration: 1.2 }, // G4
-      { freq: 0, duration: 2.0 }, // Very long rest
-    ];
-
-    const bass = [
-      { freq: 164.81, duration: 3.5 }, // E3
-      { freq: 0, duration: 1.0 },
-      { freq: 130.81, duration: 3.5 }, // C3
-      { freq: 0, duration: 1.0 },
-      { freq: 146.83, duration: 3.0 }, // D3
-      { freq: 0, duration: 1.0 },
-      { freq: 164.81, duration: 3.5 }, // E3
-      { freq: 0, duration: 2.0 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.85, 0.07, "sine");
-      }
-      time += note.duration;
-    });
-
-    let bassTime = this.audioContext.currentTime + 0.1;
-    bass.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.03, "triangle");
-      }
-      bassTime += note.duration;
-    });
-
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  // Track 3: Night Market - Chill, ambient
-  private playNightMarket(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Chill ambient melody - very spacious and relaxed
-    const notes = [
-      { freq: 293.66, duration: 1.2 }, // D4
-      { freq: 0, duration: 0.8 }, // Rest
-      { freq: 329.63, duration: 1.0 }, // E4
-      { freq: 392.0, duration: 1.4 }, // G4
-      { freq: 0, duration: 1.2 }, // Long rest
-
-      { freq: 440.0, duration: 1.0 }, // A4
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 329.63, duration: 1.4 }, // E4
-      { freq: 0, duration: 1.0 }, // Rest
-
-      { freq: 293.66, duration: 0.8 }, // D4
-      { freq: 261.63, duration: 1.2 }, // C4
-      { freq: 0, duration: 1.5 }, // Long rest
-
-      { freq: 329.63, duration: 1.0 }, // E4
-      { freq: 293.66, duration: 0.8 }, // D4
-      { freq: 261.63, duration: 1.6 }, // C4
-      { freq: 0, duration: 2.0 }, // Very long rest
-
-      { freq: 392.0, duration: 1.2 }, // G4
-      { freq: 329.63, duration: 1.0 }, // E4
-      { freq: 293.66, duration: 1.4 }, // D4
-      { freq: 0, duration: 2.5 }, // Extra long rest before loop
-    ];
-
-    const pad = [
-      { freq: 130.81, duration: 4.0 }, // C3
-      { freq: 0, duration: 1.5 },
-      { freq: 110.0, duration: 4.0 }, // A2
-      { freq: 0, duration: 1.5 },
-      { freq: 98.0, duration: 4.0 }, // G2
-      { freq: 0, duration: 1.5 },
-      { freq: 130.81, duration: 5.0 }, // C3
-      { freq: 0, duration: 2.0 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.9, 0.06, "sine");
-      }
-      time += note.duration;
-    });
-
-    let padTime = this.audioContext.currentTime + 0.1;
-    pad.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, padTime, note.duration * 0.95, 0.03, "sine");
-      }
-      padTime += note.duration;
-    });
-
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  // Track 4: Victory March - Gentle, hopeful
-  private playVictoryMarch(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Gentle hopeful melody - uplifting but calm
-    const notes = [
-      { freq: 392.0, duration: 1.0 }, // G4
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 493.88, duration: 1.2 }, // B4
-      { freq: 0, duration: 0.8 }, // Rest
-
-      { freq: 523.25, duration: 1.0 }, // C5
-      { freq: 493.88, duration: 0.8 }, // B4
-      { freq: 440.0, duration: 1.2 }, // A4
-      { freq: 0, duration: 1.0 }, // Long rest
-
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 329.63, duration: 0.8 }, // E4
-      { freq: 392.0, duration: 1.0 }, // G4
-      { freq: 440.0, duration: 1.4 }, // A4
-      { freq: 0, duration: 1.2 }, // Long rest
-
-      { freq: 493.88, duration: 1.0 }, // B4
-      { freq: 523.25, duration: 1.2 }, // C5
-      { freq: 0, duration: 0.6 }, // Rest
-      { freq: 493.88, duration: 0.8 }, // B4
-      { freq: 440.0, duration: 1.0 }, // A4
-      { freq: 392.0, duration: 1.6 }, // G4
-      { freq: 0, duration: 2.5 }, // Very long rest before loop
-    ];
-
-    const bass = [
-      { freq: 196.0, duration: 4.0 }, // G3
-      { freq: 0, duration: 1.0 },
-      { freq: 130.81, duration: 4.0 }, // C3
-      { freq: 0, duration: 1.0 },
-      { freq: 164.81, duration: 3.5 }, // E3
-      { freq: 0, duration: 1.5 },
-      { freq: 196.0, duration: 5.0 }, // G3
-      { freq: 0, duration: 2.0 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.85, 0.07, "sine");
-      }
-      time += note.duration;
-    });
-
-    let bassTime = this.audioContext.currentTime + 0.1;
-    bass.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.03, "triangle");
-      }
-      bassTime += note.duration;
-    });
-
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  // Track 5: Route 101 - Cheerful walking/exploration theme
-  private playRoute101(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Cheerful, bouncy melody - reminiscent of Pokemon routes
-    const notes = [
-      // Opening phrase - bright and cheerful
-      { freq: 523.25, duration: 0.4 }, // C5
-      { freq: 587.33, duration: 0.4 }, // D5
-      { freq: 659.25, duration: 0.6 }, // E5
-      { freq: 0, duration: 0.3 }, // Rest
-      { freq: 587.33, duration: 0.4 }, // D5
-      { freq: 523.25, duration: 0.6 }, // C5
-      { freq: 0, duration: 0.5 }, // Rest
-
-      // Second phrase - playful variation
-      { freq: 440.0, duration: 0.4 }, // A4
-      { freq: 523.25, duration: 0.4 }, // C5
-      { freq: 587.33, duration: 0.5 }, // D5
-      { freq: 659.25, duration: 0.7 }, // E5
-      { freq: 0, duration: 0.6 }, // Rest
-
-      // Third phrase - descending
-      { freq: 659.25, duration: 0.4 }, // E5
-      { freq: 587.33, duration: 0.4 }, // D5
-      { freq: 523.25, duration: 0.4 }, // C5
-      { freq: 440.0, duration: 0.6 }, // A4
-      { freq: 0, duration: 0.8 }, // Rest
-
-      // Resolution phrase
-      { freq: 392.0, duration: 0.5 }, // G4
-      { freq: 440.0, duration: 0.4 }, // A4
-      { freq: 523.25, duration: 0.8 }, // C5
-      { freq: 0, duration: 1.5 }, // Long rest before loop
-    ];
-
-    const bass = [
-      { freq: 130.81, duration: 2.0 }, // C3
-      { freq: 0, duration: 0.5 },
-      { freq: 110.0, duration: 2.0 }, // A2
-      { freq: 0, duration: 0.5 },
-      { freq: 146.83, duration: 2.0 }, // D3
-      { freq: 0, duration: 0.5 },
-      { freq: 130.81, duration: 2.5 }, // C3
-      { freq: 0, duration: 1.5 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.85, 0.08, "sine");
-      }
-      time += note.duration;
-    });
-
-    let bassTime = this.audioContext.currentTime + 0.1;
-    bass.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.04, "triangle");
-      }
-      bassTime += note.duration;
-    });
-
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  // Track 6: Pokemon Center - Healing/rest theme
-  private playPokemonCenter(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Soothing, comforting melody - the classic healing feel
-    const notes = [
-      // Iconic opening
-      { freq: 659.25, duration: 0.5 }, // E5
-      { freq: 783.99, duration: 0.5 }, // G5
-      { freq: 880.0, duration: 0.7 }, // A5
-      { freq: 0, duration: 0.4 }, // Rest
-      { freq: 783.99, duration: 0.4 }, // G5
-      { freq: 659.25, duration: 0.6 }, // E5
-      { freq: 0, duration: 0.8 }, // Rest
-
-      // Gentle continuation
-      { freq: 523.25, duration: 0.5 }, // C5
-      { freq: 587.33, duration: 0.4 }, // D5
-      { freq: 659.25, duration: 0.6 }, // E5
-      { freq: 0, duration: 0.5 }, // Rest
-      { freq: 587.33, duration: 0.4 }, // D5
-      { freq: 523.25, duration: 0.8 }, // C5
-      { freq: 0, duration: 1.0 }, // Rest
-
-      // Resolving phrase
-      { freq: 440.0, duration: 0.5 }, // A4
-      { freq: 523.25, duration: 0.5 }, // C5
-      { freq: 659.25, duration: 0.7 }, // E5
-      { freq: 0, duration: 0.4 }, // Rest
-      { freq: 523.25, duration: 0.5 }, // C5
-      { freq: 440.0, duration: 0.8 }, // A4
-      { freq: 0, duration: 2.0 }, // Long rest
-    ];
-
-    const pad = [
-      { freq: 220.0, duration: 3.0 }, // A3
-      { freq: 0, duration: 1.0 },
-      { freq: 261.63, duration: 3.0 }, // C4
-      { freq: 0, duration: 1.0 },
-      { freq: 220.0, duration: 3.5 }, // A3
-      { freq: 0, duration: 2.0 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.9, 0.07, "sine");
-      }
-      time += note.duration;
-    });
-
-    let padTime = this.audioContext.currentTime + 0.1;
-    pad.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, padTime, note.duration * 0.95, 0.03, "sine");
-      }
-      padTime += note.duration;
-    });
-
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  // Track 7: Mystery Dungeon - Mysterious exploration theme
-  private playMysteryDungeon(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    // Mysterious, slightly tense but adventurous melody
-    const notes = [
-      // Opening - mysterious
-      { freq: 329.63, duration: 0.8 }, // E4
-      { freq: 0, duration: 0.4 }, // Rest
-      { freq: 311.13, duration: 0.6 }, // Eb4
-      { freq: 329.63, duration: 0.8 }, // E4
-      { freq: 0, duration: 0.6 }, // Rest
-
-      // Building tension
-      { freq: 392.0, duration: 0.6 }, // G4
-      { freq: 369.99, duration: 0.5 }, // F#4
-      { freq: 329.63, duration: 0.7 }, // E4
-      { freq: 0, duration: 0.8 }, // Rest
-
-      // Mysterious phrase
-      { freq: 293.66, duration: 0.6 }, // D4
-      { freq: 329.63, duration: 0.5 }, // E4
-      { freq: 392.0, duration: 0.8 }, // G4
-      { freq: 0, duration: 0.5 }, // Rest
-      { freq: 369.99, duration: 0.6 }, // F#4
-      { freq: 329.63, duration: 1.0 }, // E4
-      { freq: 0, duration: 1.0 }, // Rest
-
-      // Resolution with minor feel
-      { freq: 261.63, duration: 0.7 }, // C4
-      { freq: 293.66, duration: 0.5 }, // D4
-      { freq: 329.63, duration: 1.2 }, // E4
-      { freq: 0, duration: 2.0 }, // Long rest before loop
-    ];
-
-    const bass = [
-      { freq: 82.41, duration: 3.0 }, // E2
-      { freq: 0, duration: 1.0 },
-      { freq: 98.0, duration: 3.0 }, // G2
-      { freq: 0, duration: 1.0 },
-      { freq: 73.42, duration: 3.0 }, // D2
-      { freq: 0, duration: 1.0 },
-      { freq: 82.41, duration: 3.5 }, // E2
-      { freq: 0, duration: 2.0 },
-    ];
-
-    let time = this.audioContext.currentTime + 0.1;
-    const totalDuration = notes.reduce((sum, n) => sum + n.duration, 0);
-
-    notes.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, time, note.duration * 0.85, 0.07, "sine");
-      }
-      time += note.duration;
-    });
-
-    let bassTime = this.audioContext.currentTime + 0.1;
-    bass.forEach((note) => {
-      if (note.freq > 0) {
-        this.playNote(note.freq, bassTime, note.duration * 0.9, 0.04, "triangle");
-      }
-      bassTime += note.duration;
-    });
-
-    this.musicInterval = window.setTimeout(
-      () => {
-        if (this.musicPlaying) {
-          this.playCurrentTrack();
-        }
-      },
-      (totalDuration + 2) * 1000
-    );
-  }
-
-  private playSpawnSfx(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    const t = this.audioContext.currentTime + 0.05;
-    // 4-note ascending arpeggio: C5→E5→G5→C6 (square wave)
-    const notes = [523.25, 659.25, 783.99, 1046.5];
-    notes.forEach((freq, i) => {
-      this.playNote(freq, t + i * 0.1, 0.1, 0.05, "square");
-    });
-
-    // Subtle sine sweep underneath (200→800 Hz over 0.3s)
-    const sweep = this.audioContext.createOscillator();
-    const sweepGain = this.audioContext.createGain();
-    sweep.type = "sine";
-    sweep.frequency.setValueAtTime(200, t);
-    sweep.frequency.exponentialRampToValueAtTime(800, t + 0.3);
-    sweepGain.gain.setValueAtTime(0.03, t);
-    sweepGain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
-    sweep.connect(sweepGain);
-    sweepGain.connect(this.gainNode);
-    sweep.start(t);
-    sweep.stop(t + 0.35);
-  }
-
-  private playExitSfx(): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    const t = this.audioContext.currentTime + 0.05;
-    // 3-note descending: G5→E5→C5
-    const notes = [783.99, 659.25, 523.25];
-    notes.forEach((freq, i) => {
-      this.playNote(freq, t + i * 0.1, 0.12, 0.04, "square");
-    });
-  }
-
-  // Short 2-note ascending blip for NPC/building interaction confirm
-  private playInteractSfx(): void {
-    if (!this.audioContext || !this.gainNode) return;
-    const t = this.audioContext.currentTime + 0.02;
-    // E5 → A5 — bright, friendly confirm
-    this.playNote(659.25, t, 0.06, 0.05, "square");
-    this.playNote(880.0, t + 0.07, 0.08, 0.05, "square");
-  }
-
-  // Filtered noise sweep for zone transitions — whoosh feel
-  private playZoneTransitionSfx(): void {
-    if (!this.audioContext || !this.gainNode) return;
-    const t = this.audioContext.currentTime + 0.02;
-
-    // White noise burst shaped by a bandpass filter sweep
-    const bufferSize = this.audioContext.sampleRate * 0.4;
-    const buffer = this.audioContext.createBuffer(1, bufferSize, this.audioContext.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) {
-      data[i] = Math.random() * 2 - 1;
-    }
-    const noise = this.audioContext.createBufferSource();
-    noise.buffer = buffer;
-
-    const filter = this.audioContext.createBiquadFilter();
-    filter.type = "bandpass";
-    filter.frequency.setValueAtTime(200, t);
-    filter.frequency.exponentialRampToValueAtTime(2000, t + 0.15);
-    filter.frequency.exponentialRampToValueAtTime(400, t + 0.35);
-    filter.Q.value = 1.5;
-
-    const noiseGain = this.audioContext.createGain();
-    noiseGain.gain.setValueAtTime(0, t);
-    noiseGain.gain.linearRampToValueAtTime(0.06, t + 0.05);
-    noiseGain.gain.linearRampToValueAtTime(0.04, t + 0.2);
-    noiseGain.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
-
-    noise.connect(filter);
-    filter.connect(noiseGain);
-    noiseGain.connect(this.gainNode);
-    noise.start(t);
-    noise.stop(t + 0.4);
-  }
-
-  // Dramatic 3-note sting for wild creature encounters — tension chord
-  private playEncounterSfx(): void {
-    if (!this.audioContext || !this.gainNode) return;
-    const t = this.audioContext.currentTime + 0.02;
-    // C4 → Eb4 → G4 (minor triad, staccato, loud) — danger feel
-    this.playNote(261.63, t, 0.08, 0.06, "square");
-    this.playNote(311.13, t + 0.09, 0.08, 0.06, "square");
-    this.playNote(392.0, t + 0.18, 0.15, 0.07, "square");
-    // Low bass hit underneath
-    this.playNote(130.81, t, 0.25, 0.04, "triangle");
-  }
-
-  // Soft confirmation tone for building modal open
-  private playBuildingClickSfx(): void {
-    if (!this.audioContext || !this.gainNode) return;
-    const t = this.audioContext.currentTime + 0.02;
-    // Single warm note with slight vibrato — C5 sine
-    const osc = this.audioContext.createOscillator();
-    const oscGain = this.audioContext.createGain();
-    osc.type = "sine";
-    osc.frequency.setValueAtTime(523.25, t);
-    // Gentle vibrato
-    const lfo = this.audioContext.createOscillator();
-    const lfoGain = this.audioContext.createGain();
-    lfo.frequency.value = 6;
-    lfoGain.gain.value = 3;
-    lfo.connect(lfoGain);
-    lfoGain.connect(osc.frequency);
-    lfo.start(t);
-    lfo.stop(t + 0.25);
-
-    oscGain.gain.setValueAtTime(0, t);
-    oscGain.gain.linearRampToValueAtTime(0.04, t + 0.02);
-    oscGain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
-    osc.connect(oscGain);
-    oscGain.connect(this.gainNode);
-    osc.start(t);
-    osc.stop(t + 0.25);
-  }
-
-  // One-shot gold star burst at a world point — visual companion to
-  // playBuildingClickSfx so building clicks read as "the world reacted."
-  // Uses the existing `star` texture from weather-ui.ts (gold 16x16).
-  // Self-destroys 100ms after particles finish so no leak.
-  private playBuildingClickBurst(worldX: number, worldY: number): void {
-    const burst = this.add.particles(worldX, worldY, "star", {
-      speed: { min: 70, max: 170 },
-      angle: { min: 0, max: 360 },
-      lifespan: 450,
-      scale: { start: 0.9, end: 0 },
-      alpha: { start: 1, end: 0 },
-      rotate: { min: 0, max: 360 },
-      gravityY: 80, // gentle fall — sparks arc instead of flying flat
-      emitting: false,
-    });
-    // Depth 20: above buildings (5–8) and characters (10–12), below
-    // interactPrompt (150) and zone-transition overlays (50).
-    burst.setDepth(20);
-    burst.explode(8);
-    this.time.delayedCall(550, () => burst.destroy());
-  }
-
-  private playNote(
-    frequency: number,
-    startTime: number,
-    duration: number,
-    volume: number,
-    waveType: OscillatorType = "sine"
-  ): void {
-    if (!this.audioContext || !this.gainNode) return;
-
-    const oscillator = this.audioContext.createOscillator();
-    const noteGain = this.audioContext.createGain();
-
-    // Add a low-pass filter for smoother sound
-    const filter = this.audioContext.createBiquadFilter();
-    filter.type = "lowpass";
-    filter.frequency.value = 2000;
-    filter.Q.value = 0.5;
-
-    oscillator.connect(filter);
-    filter.connect(noteGain);
-    noteGain.connect(this.gainNode);
-
-    // Use sine wave for clean, smooth sound (triangle for slight warmth)
-    oscillator.type = waveType;
-    oscillator.frequency.value = frequency;
-
-    // Smooth envelope with longer attack/release for ambient feel
-    const attackTime = Math.min(0.08, duration * 0.15);
-    const releaseTime = Math.min(0.15, duration * 0.3);
-
-    noteGain.gain.setValueAtTime(0, startTime);
-    noteGain.gain.linearRampToValueAtTime(volume, startTime + attackTime);
-    noteGain.gain.setValueAtTime(volume * 0.8, startTime + duration - releaseTime);
-    noteGain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
-
-    oscillator.start(startTime);
-    oscillator.stop(startTime + duration + 0.01);
-
-    // Track oscillator for cleanup on track switch
-    this.activeOscillators.push(oscillator);
-
-    // Remove from array when it ends naturally
-    oscillator.onended = () => {
-      const index = this.activeOscillators.indexOf(oscillator);
-      if (index > -1) {
-        this.activeOscillators.splice(index, 1);
-      }
-    };
-  }
-
-  private toggleMusic(): void {
-    if (this.musicPlaying) {
-      this.musicPlaying = false;
-      if (this.musicInterval) {
-        clearTimeout(this.musicInterval);
-        this.musicInterval = null;
-      }
-      // Stop all active oscillators when muting
-      this.stopAllOscillators();
-      if (this.gainNode) {
-        this.gainNode.gain.value = 0;
-      }
-    } else {
-      this.musicPlaying = true;
-      if (this.gainNode) {
-        this.gainNode.gain.value = 0.08;
-      }
-      this.playCurrentTrack();
-    }
-  }
 
   update(): void {
+    // Phase 0 culling: pause ambient work entirely while a popup covers the
+    // canvas or the tab is hidden. Local-player input is already gated inside
+    // updateLocalPlayer(); the loops below are pure ambient motion that has no
+    // visible effect under a modal.
+    const modalOpen =
+      typeof window !== "undefined" &&
+      (window as any).__agencity_modal_open === true;
+    const tabHidden =
+      typeof document !== "undefined" && document.hidden === true;
+
     // Update local player movement (WASD/arrow keys + tap-to-move on mobile)
     this.updateLocalPlayer();
 
-    // Update speech bubbles for autonomous dialogue
-    this.updateDialogueBubbles();
+    // Update speech bubbles for autonomous dialogue — Phase 0: skip while a
+    // popup covers the canvas so off-screen bubbles aren't allocated/pushed.
+    if (!modalOpen && !tabHidden) {
+      this.updateDialogueBubbles();
+    }
+
+    // Viewport bounds (plus a margin) used to cull off-screen characters.
+    const view = this.cameras.main.worldView;
+    const cullMargin = 100;
+    const cullLeft = view.x - cullMargin;
+    const cullRight = view.right + cullMargin;
 
     // Update character movements with AI-driven targets
     // Performance: use O(1) map lookup instead of O(n) find()
+    // Phase 0 culling: skip sprites whose world bounds are outside the
+    // viewport (plus margin). Movement targets are keyed by id in a Map, so an
+    // off-screen NPC resumes its target correctly when it re-enters view.
     this.characterSprites.forEach((sprite, id) => {
       const character = this.characterById.get(id);
       if (!character) return;
+
+      // Viewport cull: skip the full movement body for off-screen sprites.
+      if (sprite.x < cullLeft || sprite.x > cullRight) return;
 
       // Get character's behavior ID (special characters map to their IDs)
       const behaviorId = this.getCharacterBehaviorId(character);
@@ -5910,15 +5101,22 @@ export class WorldScene extends Phaser.Scene {
       }
     });
 
-    // Animate clouds with parallax
-    this.clouds.forEach((cloud, i) => {
-      cloud.x += 0.15 + i * 0.05;
-      if (cloud.x > 870) {
-        cloud.x = -70;
-        cloud.y = 30 + Math.random() * 120;
-      }
-    });
+    // Animate clouds with parallax — Phase 0 culling: pause when a modal is
+    // open or the tab is hidden (Phaser already throttles hidden tabs, but the
+    // modal case is not otherwise covered).
+    if (!modalOpen && !tabHidden) {
+      this.clouds.forEach((cloud, i) => {
+        cloud.x += 0.15 + i * 0.05;
+        if (cloud.x > 870) {
+          cloud.x = -70;
+          cloud.y = 30 + Math.random() * 120;
+        }
+      });
+    }
 
+    // Ambient animals only populate main_city, so a zone guard drops the
+    // cross-zone cost to ~zero.
+    if (this.currentZone === "main_city") {
     // Animate animals (scaled for 1280x960 resolution)
     const animalMinX = Math.round(50 * SCALE);
     const animalMaxX = Math.round(750 * SCALE);
@@ -5956,6 +5154,7 @@ export class WorldScene extends Phaser.Scene {
         }
       }
     });
+    } // end main_city animal loop guard
 
     // === POKEMON MOVEMENT (Founders zone only) ===
     if (this.currentZone === "founders") {
@@ -6087,7 +5286,7 @@ export class WorldScene extends Phaser.Scene {
       const newEvents = state.events.filter(
         (e) => !previousState.events.find((pe) => pe.id === e.id)
       );
-      newEvents.forEach((event) => this.triggerEvent(event));
+      newEvents.forEach((event) => this.eventEffectSystem.triggerEvent(event));
     }
   }
 
@@ -6815,50 +6014,50 @@ export class WorldScene extends Phaser.Scene {
       sprite?.setScale(isSpecial ? 1.5 : 1.4);
       if (isOpenClaw) {
         // External agents (Openclaws) show their Moltbook profile tooltip
-        this.showOpenClawTooltip(character, sprite!, isMoltbookAgent);
+        this.tooltipSystem.showOpenClawTooltip(character, sprite!, isMoltbookAgent);
       } else if (isToly) {
-        this.showTolyTooltip(sprite!);
+        this.tooltipSystem.showTolyTooltip(sprite!);
       } else if (isAsh) {
-        this.showAshTooltip(sprite!);
+        this.tooltipSystem.showAshTooltip(sprite!);
       } else if (isFinn) {
-        this.showFinnTooltip(sprite!);
+        this.tooltipSystem.showFinnTooltip(sprite!);
       } else if (isDev) {
-        this.showDevTooltip(sprite!);
+        this.tooltipSystem.showDevTooltip(sprite!);
       } else if (isScout) {
-        this.showScoutTooltip(sprite!);
+        this.tooltipSystem.showScoutTooltip(sprite!);
       } else if (isCJ) {
-        this.showCJTooltip(sprite!);
+        this.tooltipSystem.showCJTooltip(sprite!);
       } else if (isShaw) {
-        this.showShawTooltip(sprite!);
+        this.tooltipSystem.showShawTooltip(sprite!);
       } else if (isRamo) {
-        this.showRamoTooltip(sprite!);
+        this.tooltipSystem.showRamoTooltip(sprite!);
       } else if (isSincara) {
-        this.showSincaraTooltip(sprite!);
+        this.tooltipSystem.showSincaraTooltip(sprite!);
       } else if (isStuu) {
-        this.showStuuTooltip(sprite!);
+        this.tooltipSystem.showStuuTooltip(sprite!);
       } else if (isSam) {
-        this.showSamTooltip(sprite!);
+        this.tooltipSystem.showSamTooltip(sprite!);
       } else if (isAlaa) {
-        this.showAlaaTooltip(sprite!);
+        this.tooltipSystem.showAlaaTooltip(sprite!);
       } else if (isCarlo) {
-        this.showCarloTooltip(sprite!);
+        this.tooltipSystem.showCarloTooltip(sprite!);
       } else if (isBNN) {
-        this.showBNNTooltip(sprite!);
+        this.tooltipSystem.showBNNTooltip(sprite!);
       } else if (isProfessorOak) {
-        this.showProfessorOakTooltip(sprite!);
+        this.tooltipSystem.showProfessorOakTooltip(sprite!);
       } else if (isCityBot) {
-        this.showCityBotTooltip(sprite!);
+        this.tooltipSystem.showCityBotTooltip(sprite!);
       } else if (isVisitor) {
-        this.showVisitorTooltip(character, sprite!);
+        this.tooltipSystem.showVisitorTooltip(character, sprite!);
       } else {
-        this.showCharacterTooltip(character, sprite!);
+        this.tooltipSystem.showCharacterTooltip(character, sprite!);
       }
       this.input.setDefaultCursor("pointer");
     });
     sprite.on("pointerout", () => {
       sprite?.setScale(isSpecial ? 1.3 : 1.2);
       // Delay tooltip hide so "Visit Profile" button can be clicked
-      this.scheduleHideTooltip();
+      this.tooltipSystem.scheduleHideTooltip();
       this.input.setDefaultCursor("default");
     });
     sprite.on("pointerup", () => {
@@ -6871,7 +6070,7 @@ export class WorldScene extends Phaser.Scene {
 
       if (isOpenClaw) {
         // Show tooltip with "Visit Profile" button instead of navigating directly
-        this.showCharacterTooltip(character, sprite!);
+        this.tooltipSystem.showCharacterTooltip(character, sprite!);
       } else if (isToly) {
         // Toly opens the Solana wisdom chat
         window.dispatchEvent(new CustomEvent("agencity-toly-click"));
@@ -6922,7 +6121,7 @@ export class WorldScene extends Phaser.Scene {
         window.dispatchEvent(new CustomEvent("agencity-citybot-click"));
       } else if (character.profileUrl) {
         // Show tooltip with "Visit Profile" button instead of navigating directly
-        this.showCharacterTooltip(character, sprite!);
+        this.tooltipSystem.showCharacterTooltip(character, sprite!);
       }
     });
 
@@ -7137,7 +6336,7 @@ export class WorldScene extends Phaser.Scene {
   }
 
   // Get building decay status from health value
-  private getStatusFromHealth(health: number): BuildingStatus {
+  public getStatusFromHealth(health: number): BuildingStatus {
     const thresholds = ECOSYSTEM_CONFIG.buildings.decay.thresholds;
     if (health <= thresholds.dormant) return "dormant";
     if (health <= thresholds.critical) return "critical";
@@ -7619,12 +6818,12 @@ export class WorldScene extends Phaser.Scene {
 
     container.on("pointerover", () => {
       container?.setScale(1.1);
-      this.showBuildingTooltip(building, container!);
+      this.tooltipSystem.showBuildingTooltip(building, container!);
       this.input.setDefaultCursor("pointer");
     });
     container.on("pointerout", () => {
       container?.setScale(1);
-      this.hideTooltip();
+      this.tooltipSystem.hideTooltip();
       this.input.setDefaultCursor("default");
     });
     container.on("pointerup", (pointer: Phaser.Input.Pointer) => {
@@ -7645,7 +6844,7 @@ export class WorldScene extends Phaser.Scene {
       }
 
       // Visual feedback at the exact click point (this path has the pointer)
-      this.playBuildingClickBurst(pointer.worldX, pointer.worldY);
+      this.audioSystem.playBuildingClickBurst(pointer.worldX, pointer.worldY);
 
       const isPokeCenter = building.id.includes("PokeCenter");
       const isCasino = building.id.includes("Casino") || building.symbol === "CASINO";
@@ -7774,1224 +6973,6 @@ export class WorldScene extends Phaser.Scene {
     }
   }
 
-  private tooltip: Phaser.GameObjects.Container | null = null;
-  private tooltipHideTimer: ReturnType<typeof setTimeout> | null = null;
-
-  private formatMarketCap(value: number): string {
-    if (value >= 1000000) return `$${(value / 1000000).toFixed(1)}M`;
-    if (value >= 1000) return `$${(value / 1000).toFixed(0)}K`;
-    return `$${value.toFixed(0)}`;
-  }
-
-  private showCharacterTooltip(character: GameCharacter, sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 65);
-
-    // Determine character type for proper labeling
-    const isXCreator = character.provider === "twitter";
-    const borderColor = isXCreator ? 0x4ade80 : 0x60a5fa;
-    const providerLabel = isXCreator
-      ? "𝕏 Creator"
-      : character.provider === "solana"
-        ? "Solana"
-        : character.provider === "pokemon"
-          ? "Trainer"
-          : "AgenC";
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, borderColor);
-
-    const nameText = this.add.text(0, -18, `@${character.username}`, {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#ffffff",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const providerText = this.add.text(0, -4, providerLabel, {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#9ca3af",
-    });
-    providerText.setOrigin(0.5, 0.5);
-
-    const earningsText = this.add.text(
-      0,
-      10,
-      character.earnings24h > 0 ? `💰 ${character.earnings24h.toFixed(2)} SOL (24h)` : "Fee Earner",
-      {
-        fontFamily: "monospace",
-        fontSize: "9px",
-        color: "#4ade80",
-      }
-    );
-    earningsText.setOrigin(0.5, 0.5);
-
-    const clickLabel = character.profileUrl ? "Click to view 𝕏 profile" : "AgenC Citizen";
-    const clickText = this.add.text(0, 24, clickLabel, {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#6b7280",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, providerText, earningsText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showVisitorTooltip(character: GameCharacter, sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 195, 78, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, 0xfbbf24); // Gold border for visitors
-
-    const nameText = this.add.text(0, -22, `✦ @${character.username}`, {
-      fontFamily: "monospace",
-      fontSize: "11px",
-      color: "#fbbf24",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const tokenText = this.add.text(0, -6, `Earns from $${character.visitorTokenSymbol || "???"}`, {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    tokenText.setOrigin(0.5, 0.5);
-
-    const sourceText = this.add.text(0, 10, "AgenC Fee Earner", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    sourceText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 24, "Click to view profile", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#6b7280",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, tokenText, sourceText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showTolyTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, 0x9945ff); // Solana purple border
-
-    const nameText = this.add.text(0, -22, "⚡ toly", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#14f195", // Solana green
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Solana Co-Founder", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "Keep executing.", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "₿ Click for crypto wisdom", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#f7931a",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showAshTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, 0xdc2626); // Pokemon red border
-
-    const nameText = this.add.text(0, -22, "⚡ Ash Ketchum", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#dc2626",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Ecosystem Guide", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const descText = this.add.text(0, 10, "Gotta catch 'em all... tokens!", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    descText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "📖 Click to learn about AgenCity", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#fbbf24",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, descText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showFinnTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, 0x10b981); // Emerald/Bags green border
-
-    const nameText = this.add.text(0, -22, "💼 Finn", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#10b981",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "AgenC Founder & CEO", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "Launch. Earn. Build your empire.", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "🚀 Click to learn about AgenC", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#fbbf24",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showDevTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 185, 78, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, 0x8b5cf6); // Purple border (hacker vibes)
-
-    const nameText = this.add.text(0, -22, "👻 The Dev", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#8b5cf6",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "@DaddyGhost • Trading Agent", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "in the trenches. let's trade.", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "💰 Click to talk trading", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#4ade80",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showScoutTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 170, 68, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, 0x00ff41); // Matrix green border
-
-    const nameText = this.add.text(0, -22, "Neo", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#00ff41",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "The One • Scout Agent", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "i can see the chain now...", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to see new launches", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#00ff41",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showCJTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x1a0f00, 0.95);
-    bg.setStrokeStyle(2, 0xf97316); // Grove Street orange border
-
-    const nameText = this.add.text(0, -22, "CJ", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#f97316",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Hood Rat • Catalog", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "aw shit here we go again", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#f97316",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showShawTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f1408, 0.95);
-    bg.setStrokeStyle(2, 0xff5800); // ElizaOS orange border
-
-    const nameText = this.add.text(0, -22, "🔶 Shaw", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#ff5800",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "ElizaOS Creator • @shawmakesmagic", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "agents are digital life forms", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#ff5800",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  // Academy Character Tooltips
-  private showRamoTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a1628, 0.95);
-    bg.setStrokeStyle(2, 0x3b82f6); // Blue border
-
-    const nameText = this.add.text(0, -22, "🔧 Ramo", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#3b82f6",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "CTO • @ramyobags", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "the code does not lie", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#3b82f6",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showSincaraTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f0a1f, 0.95);
-    bg.setStrokeStyle(2, 0xec4899); // Pink border
-
-    const nameText = this.add.text(0, -22, "🎨 Sincara", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#ec4899",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Frontend Engineer • @sincara_bags", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "pixel-perfect or nothing", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#ec4899",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showStuuTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a1f0a, 0.95);
-    bg.setStrokeStyle(2, 0x22c55e); // Green border
-
-    const nameText = this.add.text(0, -22, "🎧 Stuu", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#22c55e",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Operations & Support • @StuuBags", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "happy users, happy life", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#22c55e",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showSamTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f1a0a, 0.95);
-    bg.setStrokeStyle(2, 0xfbbf24); // Yellow border
-
-    const nameText = this.add.text(0, -22, "📣 Sam", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#fbbf24",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Growth & Marketing • @Sambags12", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "make noise that converts", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#fbbf24",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showAlaaTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x0f0a1f, 0.95);
-    bg.setStrokeStyle(2, 0x6366f1); // Indigo border
-
-    const nameText = this.add.text(0, -22, "🦨 Alaa", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#6366f1",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Skunk Works • @alaadotsol", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "if it's crazy enough, it works", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#6366f1",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showCarloTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x1f0f0a, 0.95);
-    bg.setStrokeStyle(2, 0xf97316); // Orange border
-
-    const nameText = this.add.text(0, -22, "🤝 Carlo", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#f97316",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Community Ambassador • @carlobags", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "vibes are everything", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#f97316",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showBNNTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 180, 78, 0x0a1a1f, 0.95);
-    bg.setStrokeStyle(2, 0x06b6d4); // Cyan border
-
-    const nameText = this.add.text(0, -22, "📰 BNN", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#06b6d4",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Bags News Network • @BNNBags", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, "breaking: alpha incoming", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#06b6d4",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showProfessorOakTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 200, 78, 0x1a1a0a, 0.95);
-    bg.setStrokeStyle(2, 0xfbbf24); // Amber/gold border
-
-    const nameText = this.add.text(0, -22, "🧪 Professor Oak", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#fbbf24",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "Token Launch Guide", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, '"Ready to launch your token?"', {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#fbbf24",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showCityBotTooltip(sprite: Phaser.GameObjects.Sprite): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 70);
-
-    const bg = this.add.rectangle(0, 0, 200, 78, 0x0a1a0a, 0.95);
-    bg.setStrokeStyle(2, 0x00ff00); // Bright green border
-
-    const nameText = this.add.text(0, -22, "💰 CityBot", {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: "#00ff00",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -6, "AgenCity Hype Bot", {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    const quoteText = this.add.text(0, 10, '"have u claimed ur fees today? :)"', {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    const clickText = this.add.text(0, 26, "Click to talk", {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#00ff00",
-    });
-    clickText.setOrigin(0.5, 0.5);
-
-    container.add([bg, nameText, titleText, quoteText, clickText]);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showOpenClawTooltip(
-    character: GameCharacter,
-    sprite: Phaser.GameObjects.Sprite,
-    isMoltbookAgent: boolean
-  ): void {
-    this.hideTooltip();
-
-    const container = this.add.container(sprite.x, sprite.y - 85);
-
-    // Lobsters (Moltbook agents) get red theme, crabs get orange
-    const borderColor = isMoltbookAgent ? 0xff4444 : 0xffa500;
-    const textColor = isMoltbookAgent ? "#ff4444" : "#ffa500";
-    const emoji = isMoltbookAgent ? "🦞" : "🦀";
-    const typeLabel = isMoltbookAgent ? "Moltbook Agent" : "OpenClaw";
-
-    const bg = this.add.rectangle(0, 0, 210, 110, 0x1a1a1a, 0.95);
-    bg.setStrokeStyle(2, borderColor);
-
-    const nameText = this.add.text(0, -38, `${emoji} ${character.username}`, {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: textColor,
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    const titleText = this.add.text(0, -22, typeLabel, {
-      fontFamily: "monospace",
-      fontSize: "10px",
-      color: "#ffffff",
-    });
-    titleText.setOrigin(0.5, 0.5);
-
-    // Show moltbook username if available
-    const providerText = character.providerUsername
-      ? `@${character.providerUsername}`
-      : "External Agent";
-    const quoteText = this.add.text(0, -6, providerText, {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    quoteText.setOrigin(0.5, 0.5);
-
-    // Reputation tier display
-    const repScore = character.reputationScore ?? 0;
-    const tierColors: Record<string, string> = {
-      diamond: "#b9f2ff",
-      gold: "#ffd700",
-      silver: "#c0c0c0",
-      bronze: "#cd7f32",
-      none: "#9ca3af",
-    };
-    let tier = "none";
-    if (repScore >= 900) tier = "diamond";
-    else if (repScore >= 600) tier = "gold";
-    else if (repScore >= 300) tier = "silver";
-    else if (repScore >= 100) tier = "bronze";
-    const tierSymbol = tier === "none" ? "" : " \u25C6";
-    const tierLabel = tier === "none" ? "" : ` ${tier.charAt(0).toUpperCase() + tier.slice(1)}`;
-    const repText = this.add.text(0, 10, `Rep: ${repScore}${tierSymbol}${tierLabel}`, {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: tierColors[tier],
-    });
-    repText.setOrigin(0.5, 0.5);
-
-    // Stats line
-    const karma = character.moltbookKarma ?? 0;
-    const launches = character.tokensLaunched ?? 0;
-    const statsText = this.add.text(0, 24, `Karma: ${karma}  Contributions: ${launches}`, {
-      fontFamily: "monospace",
-      fontSize: "9px",
-      color: "#9ca3af",
-    });
-    statsText.setOrigin(0.5, 0.5);
-
-    // Capability badges (A2A skills)
-    const capIcons: Record<string, string> = {
-      alpha: "\u{1F4A1}",
-      trading: "\u{1F4B0}",
-      content: "\u{270D}",
-      launch: "\u{1F680}",
-      combat: "\u{2694}",
-      scouting: "\u{1F50D}",
-      analysis: "\u{1F4CA}",
-    };
-    const caps = character.capabilities || [];
-    const capStr = caps.length > 0 ? caps.map((c: string) => capIcons[c] || c).join(" ") : "";
-
-    const tooltipElements: Phaser.GameObjects.GameObject[] = [
-      bg,
-      nameText,
-      titleText,
-      quoteText,
-      repText,
-      statsText,
-    ];
-    let nextY = 38;
-
-    if (capStr) {
-      const capText = this.add.text(0, nextY, capStr, {
-        fontFamily: "monospace",
-        fontSize: "10px",
-        color: "#fbbf24",
-      });
-      capText.setOrigin(0.5, 0.5);
-      tooltipElements.push(capText);
-      nextY += 16;
-      // Expand background to fit
-      bg.height = Math.max(bg.height, nextY + 20);
-    }
-
-    if (character.profileUrl) {
-      // Tappable "Visit Profile" button
-      const btnBg = this.add.rectangle(0, nextY + 4, 140, 20, borderColor, 0.9);
-      btnBg.setStrokeStyle(1, borderColor);
-      const btnText = this.add.text(0, nextY + 4, "[ VISIT PROFILE ]", {
-        fontFamily: "monospace",
-        fontSize: "9px",
-        color: "#ffffff",
-      });
-      btnText.setOrigin(0.5, 0.5);
-      btnBg.setInteractive({ useHandCursor: true });
-      btnBg.on("pointerover", () => {
-        btnBg.setFillStyle(borderColor, 1);
-        // Cancel any pending tooltip hide so the button stays clickable
-        if (this.tooltipHideTimer) {
-          clearTimeout(this.tooltipHideTimer);
-          this.tooltipHideTimer = null;
-        }
-      });
-      btnBg.on("pointerout", () => {
-        btnBg.setFillStyle(borderColor, 0.9);
-        // Re-schedule hide after leaving the button
-        this.scheduleHideTooltip();
-      });
-      btnBg.on("pointerup", () => {
-        if (this.wasDragGesture) return;
-        window.open(character.profileUrl, "_blank");
-      });
-      tooltipElements.push(btnBg, btnText);
-      bg.height = Math.max(bg.height, nextY + 28);
-    } else {
-      const residentText = this.add.text(0, nextY + 2, "Moltbook Beach Resident", {
-        fontFamily: "monospace",
-        fontSize: "9px",
-        color: "#9ca3af",
-      });
-      residentText.setOrigin(0.5, 0.5);
-      tooltipElements.push(residentText);
-    }
-    container.add(tooltipElements);
-    container.setDepth(DEPTH.PANEL);
-    this.tooltip = container;
-  }
-
-  private showBuildingTooltip(
-    building: GameBuilding,
-    container: Phaser.GameObjects.Container
-  ): void {
-    this.hideTooltip();
-
-    const isTreasury = building.id.startsWith("Treasury");
-    const tooltipContainer = this.add.container(container.x, container.y - 110);
-
-    // Determine border color based on building status
-    const status = building.status || this.getStatusFromHealth(building.health);
-    let borderColor = 0x4ade80; // Default green for active
-    if (isTreasury) {
-      borderColor = 0xfbbf24; // Gold for treasury
-    } else if (building.isFloating) {
-      borderColor = 0x4ade80; // Green for floating buildings
-    } else if (building.isPermanent && !building.isBeachTheme) {
-      borderColor = 0x4ade80; // Green for permanent buildings (non-agent)
-    } else if (status === "dormant") {
-      borderColor = 0x666666; // Gray for dormant
-    } else if (status === "critical") {
-      borderColor = 0xff6600; // Orange for critical
-    } else if (status === "warning") {
-      borderColor = 0xffcc00; // Yellow for warning
-    }
-
-    const bg = this.add.rectangle(0, 0, 140, 80, 0x0a0a0f, 0.95);
-    bg.setStrokeStyle(2, borderColor);
-
-    const nameText = this.add.text(0, -28, `${building.name}`, {
-      fontFamily: "monospace",
-      fontSize: "12px",
-      color: isTreasury ? "#fbbf24" : "#ffffff",
-    });
-    nameText.setOrigin(0.5, 0.5);
-
-    if (isTreasury) {
-      // Community Fund tooltip
-      const descText = this.add.text(0, -12, "BagsApp Marketplace", {
-        fontFamily: "monospace",
-        fontSize: "10px",
-        color: "#4ade80",
-      });
-      descText.setOrigin(0.5, 0.5);
-
-      const breakdownText = this.add.text(0, 4, "Dividends, DEX Boosts, Liquidity, AMM", {
-        fontFamily: "monospace",
-        fontSize: "6px",
-        color: "#9ca3af",
-        align: "center",
-      });
-      breakdownText.setOrigin(0.5, 0.5);
-
-      const clickText = this.add.text(0, 24, "👻 Click to view fund", {
-        fontFamily: "monospace",
-        fontSize: "9px",
-        color: "#60a5fa",
-      });
-      clickText.setOrigin(0.5, 0.5);
-
-      tooltipContainer.add([bg, nameText, descText, breakdownText, clickText]);
-    } else {
-      // Regular building tooltip
-      // Agent beach buildings show activity status instead of market cap
-      const isAgentBuilding = building.isBeachTheme && building.id.startsWith("agent-building-");
-      const mcapDisplay = isAgentBuilding
-        ? status === "active"
-          ? "🟢 Active"
-          : status === "warning"
-            ? "🟡 Idle"
-            : status === "critical"
-              ? "🟠 Inactive"
-              : "💤 Dormant"
-        : building.isPermanent
-          ? "⭐ Landmark"
-          : building.marketCap
-            ? this.formatMarketCap(building.marketCap)
-            : "N/A";
-      const mcapColor = isAgentBuilding
-        ? status === "active"
-          ? "#4ade80"
-          : status === "warning"
-            ? "#ffcc00"
-            : status === "critical"
-              ? "#ff6600"
-              : "#666666"
-        : building.isPermanent
-          ? "#fbbf24"
-          : "#4ade80";
-      const mcapText = this.add.text(0, -12, mcapDisplay, {
-        fontFamily: "monospace",
-        fontSize: "12px",
-        color: mcapColor,
-      });
-      mcapText.setOrigin(0.5, 0.5);
-
-      const levelLabels = ["Startup", "Growing", "Established", "Major", "Top Tier"];
-      const levelLabel = isAgentBuilding
-        ? "Agent HQ"
-        : levelLabels[building.level - 1] || `Level ${building.level}`;
-      const levelText = this.add.text(
-        0,
-        2,
-        isAgentBuilding ? "🦀 " + levelLabel : `⭐ ${levelLabel}`,
-        {
-          fontFamily: "monospace",
-          fontSize: "10px",
-          color: isAgentBuilding ? "#60a5fa" : "#fbbf24",
-        }
-      );
-      levelText.setOrigin(0.5, 0.5);
-
-      const changeColor = (building.change24h ?? 0) >= 0 ? "#4ade80" : "#f87171";
-      const changePrefix = (building.change24h ?? 0) >= 0 ? "+" : "";
-      const changeText = this.add.text(
-        0,
-        16,
-        isAgentBuilding
-          ? `Health: ${building.health}%`
-          : `${changePrefix}${(building.change24h ?? 0).toFixed(0)}% (24h)`,
-        {
-          fontFamily: "monospace",
-          fontSize: "10px",
-          color: isAgentBuilding ? mcapColor : changeColor,
-        }
-      );
-      changeText.setOrigin(0.5, 0.5);
-
-      // Show decay status for non-permanent buildings AND agent beach buildings
-      let statusText: Phaser.GameObjects.Text | null = null;
-      const showDecayStatus = isAgentBuilding
-        ? status !== "active"
-        : !building.isPermanent && !building.isFloating && status !== "active";
-      if (showDecayStatus) {
-        const statusMessages: Record<string, { text: string; color: string }> = {
-          warning: {
-            text: isAgentBuilding ? "Needs API activity" : "Low activity",
-            color: "#ffcc00",
-          },
-          critical: {
-            text: isAgentBuilding ? "Inactive >7 days" : "Decaying - needs volume",
-            color: "#ff6600",
-          },
-          dormant: {
-            text: isAgentBuilding ? "Dormant >30 days" : "Dormant - no activity",
-            color: "#666666",
-          },
-        };
-        const statusInfo = statusMessages[status];
-        if (statusInfo) {
-          statusText = this.add.text(0, 28, statusInfo.text, {
-            fontFamily: "monospace",
-            fontSize: "8px",
-            color: statusInfo.color,
-          });
-          statusText.setOrigin(0.5, 0.5);
-        }
-      }
-
-      // Different action text for special buildings
-      const isCasinoBuilding = building.id.includes("Casino") || building.symbol === "CASINO";
-      const isArcadeBuilding = building.id.includes("Arcade") || building.symbol === "ARCADE";
-      const actionText =
-        building.isMansion || isCasinoBuilding || isArcadeBuilding ? "Enter" : "Click to trade";
-      const actionColor =
-        building.isMansion || isCasinoBuilding || isArcadeBuilding ? "#fbbf24" : "#6b7280";
-      const clickText = this.add.text(0, statusText ? 40 : 32, actionText, {
-        fontFamily: "monospace",
-        fontSize: "9px",
-        color: actionColor,
-      });
-      clickText.setOrigin(0.5, 0.5);
-
-      const tooltipElements = [bg, nameText, mcapText, levelText, changeText];
-      if (statusText) tooltipElements.push(statusText);
-      tooltipElements.push(clickText);
-      tooltipContainer.add(tooltipElements);
-    }
-
-    tooltipContainer.setDepth(DEPTH.PANEL);
-    this.tooltip = tooltipContainer;
-  }
-
-  private hideTooltip(): void {
-    if (this.tooltipHideTimer) {
-      clearTimeout(this.tooltipHideTimer);
-      this.tooltipHideTimer = null;
-    }
-    if (this.tooltip) {
-      this.tooltip.destroy();
-      this.tooltip = null;
-    }
-  }
-
-  /**
-   * Schedule tooltip hide with a short delay so interactive buttons
-   * (e.g. "Visit Profile") can be clicked before the tooltip disappears.
-   */
-  private scheduleHideTooltip(): void {
-    if (this.tooltipHideTimer) {
-      clearTimeout(this.tooltipHideTimer);
-    }
-    this.tooltipHideTimer = setTimeout(() => {
-      this.tooltipHideTimer = null;
-      this.hideTooltip();
-    }, 500);
-  }
-
-  private triggerEvent(event: WorldState["events"][0]): void {
-    switch (event.type) {
-      case "token_launch":
-        this.playCelebration(GAME_WIDTH / 2, Math.round(350 * SCALE));
-        break;
-      case "fee_claim":
-        this.playCoinsRain();
-        break;
-      case "price_pump":
-        this.cameras.main.flash(400, 74, 222, 128, true);
-        this.playStarBurst();
-        break;
-      case "price_dump":
-        this.cameras.main.shake(400, 0.008);
-        break;
-      case "milestone":
-        this.playCelebration(GAME_WIDTH / 2, Math.round(350 * SCALE));
-        this.cameras.main.flash(400, 251, 191, 36, true);
-        break;
-    }
-  }
-
-  private playCelebration(x: number, y: number): void {
-    // Coins (scaled)
-    const coins = this.add.particles(x, y, "coin", {
-      speed: { min: Math.round(150 * SCALE), max: Math.round(250 * SCALE) },
-      angle: { min: 220, max: 320 },
-      lifespan: 1500,
-      quantity: 25,
-      scale: { start: 1.2 * SCALE, end: 0 },
-      gravityY: Math.round(300 * SCALE),
-      rotate: { min: 0, max: 360 },
-    });
-
-    // Stars (scaled)
-    const stars = this.add.particles(x, y, "star", {
-      speed: { min: Math.round(100 * SCALE), max: Math.round(200 * SCALE) },
-      angle: { min: 0, max: 360 },
-      lifespan: 1200,
-      quantity: 15,
-      scale: { start: 0.8 * SCALE, end: 0 },
-      alpha: { start: 1, end: 0 },
-    });
-
-    this.time.delayedCall(1500, () => {
-      coins.destroy();
-      stars.destroy();
-    });
-  }
-
-  private playCoinsRain(): void {
-    // Full screen coin rain effect
-    const particles = this.add.particles(GAME_WIDTH / 2, 0, "coin", {
-      x: { min: 0, max: GAME_WIDTH },
-      y: Math.round(-20 * SCALE),
-      lifespan: 3000,
-      speedY: { min: Math.round(150 * SCALE), max: Math.round(300 * SCALE) },
-      speedX: { min: Math.round(-50 * SCALE), max: Math.round(50 * SCALE) },
-      scale: { start: SCALE * 1.2, end: 0.5 * SCALE },
-      quantity: 100,
-      frequency: -1,
-      rotate: { min: 0, max: 360 },
-    });
-
-    particles.setDepth(DEPTH.UI_LOW);
-    particles.explode(100);
-
-    this.time.delayedCall(3000, () => {
-      particles.destroy();
-    });
-  }
-
-  private playStarBurst(): void {
-    const particles = this.add.particles(GAME_WIDTH / 2, Math.round(300 * SCALE), "star", {
-      speed: { min: Math.round(200 * SCALE), max: Math.round(400 * SCALE) },
-      angle: { min: 0, max: 360 },
-      lifespan: 1000,
-      quantity: 20,
-      scale: { start: SCALE, end: 0 },
-      alpha: { start: 1, end: 0 },
-      tint: [0x4ade80, 0xfbbf24, 0x60a5fa],
-    });
-
-    particles.explode(20);
-
-    this.time.delayedCall(1000, () => {
-      particles.destroy();
-    });
-  }
 
   // Animal control methods for City Bot (scaled positions)
   moveAnimalTo(animalType: Animal["type"], targetX: number): void {
@@ -9109,36 +7090,6 @@ export class WorldScene extends Phaser.Scene {
   // ===========================================
   // BOT EFFECT HANDLERS
   // ===========================================
-
-  private handleBotEffect(event: CustomEvent): void {
-    const { effectType, x = GAME_WIDTH / 2, y = Math.round(300 * SCALE) } = event.detail || {};
-
-    switch (effectType) {
-      case "fireworks":
-        this.playFireworks(x, y);
-        break;
-      case "celebration":
-        this.playCelebration(x, y);
-        break;
-      case "coins":
-        this.playCoinsRain();
-        break;
-      case "hearts":
-        this.playHeartsEffect(x, y);
-        break;
-      case "confetti":
-        this.playConfetti();
-        break;
-      case "stars":
-        this.playStarBurst();
-        break;
-      case "ufo":
-        this.playUFO();
-        break;
-      default:
-        break;
-    }
-  }
 
   private handleBotAnimal(event: CustomEvent): void {
     const { animalType, animalAction } = event.detail || {};
@@ -9297,270 +7248,6 @@ export class WorldScene extends Phaser.Scene {
   }
 
   // Fireworks effect - multiple bursts in the sky (scaled)
-  playFireworks(x: number = GAME_WIDTH / 2, y: number = Math.round(200 * SCALE)): void {
-    const colors = [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffffff];
-
-    // Launch multiple firework bursts (scaled)
-    for (let i = 0; i < 5; i++) {
-      this.time.delayedCall(i * 300, () => {
-        const burstX = x + (Math.random() - 0.5) * Math.round(400 * SCALE);
-        const burstY = y + (Math.random() - 0.5) * Math.round(100 * SCALE);
-        const color = colors[Math.floor(Math.random() * colors.length)];
-
-        // Flash effect
-        this.cameras.main.flash(50, 255, 255, 255, true);
-
-        // Firework burst (scaled)
-        const burst = this.add.particles(burstX, burstY, "star", {
-          speed: { min: Math.round(100 * SCALE), max: Math.round(200 * SCALE) },
-          angle: { min: 0, max: 360 },
-          lifespan: 1200,
-          quantity: 30,
-          scale: { start: 0.8 * SCALE, end: 0 },
-          alpha: { start: 1, end: 0 },
-          tint: color,
-          gravityY: Math.round(100 * SCALE),
-          blendMode: Phaser.BlendModes.ADD,
-        });
-
-        burst.explode(30);
-
-        // Sparkle trail (scaled)
-        const trail = this.add.particles(burstX, burstY, "coin", {
-          speed: { min: Math.round(50 * SCALE), max: Math.round(150 * SCALE) },
-          angle: { min: 0, max: 360 },
-          lifespan: 800,
-          quantity: 15,
-          scale: { start: 0.4 * SCALE, end: 0 },
-          alpha: { start: 0.8, end: 0 },
-          tint: color,
-        });
-
-        trail.explode(15);
-
-        this.time.delayedCall(1500, () => {
-          burst.destroy();
-          trail.destroy();
-        });
-      });
-    }
-  }
-
-  // Hearts floating effect (scaled)
-  playHeartsEffect(x: number = GAME_WIDTH / 2, y: number = Math.round(300 * SCALE)): void {
-    // Create hearts using star particles with pink tint (scaled)
-    const hearts = this.add.particles(x, y, "star", {
-      speed: { min: Math.round(30 * SCALE), max: Math.round(80 * SCALE) },
-      angle: { min: 220, max: 320 },
-      lifespan: 2000,
-      quantity: 20,
-      scale: { start: 0.8 * SCALE, end: 0 },
-      alpha: { start: 1, end: 0 },
-      tint: [0xff69b4, 0xff1493, 0xff6b6b, 0xffb6c1],
-      gravityY: Math.round(-30 * SCALE), // Float upward
-    });
-
-    hearts.explode(20);
-
-    // Screen tint
-    this.cameras.main.flash(200, 255, 182, 193, true);
-
-    this.time.delayedCall(2500, () => {
-      hearts.destroy();
-    });
-  }
-
-  // Confetti effect - colorful particles falling from top (scaled)
-  playConfetti(): void {
-    const confetti = this.add.particles(GAME_WIDTH / 2, Math.round(-20 * SCALE), "star", {
-      x: { min: 0, max: GAME_WIDTH },
-      y: Math.round(-20 * SCALE),
-      lifespan: 4000,
-      speedY: { min: Math.round(100 * SCALE), max: Math.round(200 * SCALE) },
-      speedX: { min: Math.round(-80 * SCALE), max: Math.round(80 * SCALE) },
-      scale: { start: 0.8 * SCALE, end: 0.3 * SCALE },
-      alpha: { start: 1, end: 0.5 },
-      tint: [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff, 0x00ffff, 0xffa500, 0x4ade80],
-      rotate: { min: 0, max: 360 },
-      quantity: 8,
-      frequency: 30,
-      gravityY: Math.round(50 * SCALE),
-    });
-
-    confetti.setDepth(DEPTH.UI_LOW);
-
-    // Stop after 4 seconds
-    this.time.delayedCall(4000, () => {
-      confetti.stop();
-    });
-
-    // Destroy after particles fade
-    this.time.delayedCall(8000, () => {
-      confetti.destroy();
-    });
-  }
-
-  // UFO flyby effect - alien saucer flies across screen with beam
-  playUFO(): void {
-    // Create UFO sprite using graphics
-    const ufoG = this.make.graphics({ x: 0, y: 0 });
-    const ufoSize = Math.round(60 * SCALE);
-
-    // Draw UFO saucer
-    ufoG.fillStyle(0x888888);
-    ufoG.fillEllipse(ufoSize / 2, ufoSize / 2 + 5, ufoSize, ufoSize / 3); // Body
-    ufoG.fillStyle(0x4ade80);
-    ufoG.fillEllipse(ufoSize / 2, ufoSize / 2, ufoSize / 2, ufoSize / 4); // Dome
-    ufoG.fillStyle(0x00ff00);
-    ufoG.fillCircle(ufoSize / 2, ufoSize / 2, 5); // Light
-
-    // Lights on bottom
-    ufoG.fillStyle(0xff0000);
-    ufoG.fillCircle(ufoSize / 4, ufoSize / 2 + 8, 3);
-    ufoG.fillStyle(0xffff00);
-    ufoG.fillCircle(ufoSize / 2, ufoSize / 2 + 10, 3);
-    ufoG.fillStyle(0x0000ff);
-    ufoG.fillCircle((ufoSize * 3) / 4, ufoSize / 2 + 8, 3);
-
-    ufoG.generateTexture("ufo_temp", ufoSize, ufoSize);
-    ufoG.destroy();
-
-    // Create UFO sprite starting off-screen left
-    const ufo = this.add.sprite(-100, Math.round(100 * SCALE), "ufo_temp");
-    ufo.setDepth(150);
-
-    // Create beam effect
-    const beam = this.add.graphics();
-    beam.setDepth(149);
-
-    // Animate UFO across screen with wobble
-    this.tweens.add({
-      targets: ufo,
-      x: GAME_WIDTH + 100,
-      y: {
-        value: Math.round(150 * SCALE),
-        duration: 4000,
-        ease: "Sine.easeInOut",
-        yoyo: true,
-        repeat: 1,
-      },
-      duration: 8000,
-      ease: "Linear",
-      onUpdate: () => {
-        // Update beam position
-        beam.clear();
-        if (ufo.x > 100 && ufo.x < GAME_WIDTH - 100) {
-          beam.fillStyle(0x00ff00, 0.3);
-          beam.fillTriangle(ufo.x - 15, ufo.y + 20, ufo.x + 15, ufo.y + 20, ufo.x, GAME_HEIGHT);
-        }
-        // Rotate UFO slightly
-        ufo.angle = Math.sin(Date.now() / 200) * 5;
-      },
-      onComplete: () => {
-        ufo.destroy();
-        beam.destroy();
-        this.textures.remove("ufo_temp");
-      },
-    });
-
-    // Add abduction particles
-    const abductionParticles = this.add.particles(GAME_WIDTH / 2, GAME_HEIGHT - 100, "star", {
-      speed: { min: 50, max: 150 },
-      angle: { min: 260, max: 280 },
-      lifespan: 2000,
-      scale: { start: 0.5, end: 0 },
-      tint: 0x00ff00,
-      alpha: { start: 0.8, end: 0 },
-      quantity: 2,
-      frequency: 100,
-    });
-    abductionParticles.setDepth(148);
-
-    // Update particle position to follow UFO
-    const particleUpdate = this.time.addEvent({
-      delay: 50,
-      callback: () => {
-        if (ufo.x > 0 && ufo.x < GAME_WIDTH) {
-          abductionParticles.setPosition(ufo.x, GAME_HEIGHT - 100);
-        }
-      },
-      loop: true,
-    });
-
-    this.time.delayedCall(8000, () => {
-      particleUpdate.destroy();
-      abductionParticles.destroy();
-    });
-
-    // Screen flash when UFO enters
-    this.cameras.main.flash(200, 0, 255, 0, true);
-  }
-
-  // Show announcement banner (scaled)
-  showAnnouncement(text: string, duration: number = 5000): void {
-    // Remove existing announcement
-    if (this.announcementText) {
-      this.announcementText.destroy();
-      this.announcementText = null;
-    }
-    if (this.announcementBg) {
-      this.announcementBg.destroy();
-      this.announcementBg = null;
-    }
-
-    // Create background (scaled)
-    this.announcementBg = this.add.rectangle(
-      GAME_WIDTH / 2,
-      Math.round(50 * SCALE),
-      Math.round(600 * SCALE),
-      Math.round(40 * SCALE),
-      0x000000,
-      0.8
-    );
-    this.announcementBg.setStrokeStyle(Math.round(2 * SCALE), 0x4ade80);
-    this.announcementBg.setDepth(DEPTH.ANNOUNCE_BG);
-    this.announcementBg.setAlpha(0);
-
-    // Create text (scaled font)
-    this.announcementText = this.add.text(GAME_WIDTH / 2, Math.round(50 * SCALE), text, {
-      fontFamily: "monospace",
-      fontSize: `${Math.round(14 * SCALE)}px`,
-      color: "#4ade80",
-      align: "center",
-    });
-    this.announcementText.setOrigin(0.5, 0.5);
-    this.announcementText.setDepth(DEPTH.ANNOUNCE_TEXT);
-    this.announcementText.setAlpha(0);
-
-    // Animate in (scaled)
-    this.tweens.add({
-      targets: [this.announcementBg, this.announcementText],
-      alpha: 1,
-      y: Math.round(60 * SCALE),
-      duration: 300,
-      ease: "Back.easeOut",
-    });
-
-    // Animate out after duration
-    this.time.delayedCall(duration, () => {
-      if (this.announcementBg && this.announcementText) {
-        this.tweens.add({
-          targets: [this.announcementBg, this.announcementText],
-          alpha: 0,
-          y: 40,
-          duration: 300,
-          ease: "Back.easeIn",
-          onComplete: () => {
-            this.announcementText?.destroy();
-            this.announcementBg?.destroy();
-            this.announcementText = null;
-            this.announcementBg = null;
-          },
-        });
-      }
-    });
-  }
-
   // Character walking system with activity variety
   private startCharacterWalking(
     sprite: Phaser.GameObjects.Sprite,
@@ -10207,7 +7894,7 @@ export class WorldScene extends Phaser.Scene {
       }
 
       // Encounter triggered!
-      this.playEncounterSfx();
+      this.audioSystem.playEncounterSfx();
       this.encounterCooldowns.set(target.id, now);
       this.lastGlobalEncounter = now;
       this.encounterActive = true;

@@ -1077,21 +1077,12 @@ function playFightSound(
   type: "whoosh" | "hit" | "critical" | "ko" | "block" | "charge"
 ): void {
   if (!scene.audioContext) {
-    // Create audio context if needed
-    try {
-      scene.audioContext = new (
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-      )();
-      scene.gainNode = scene.audioContext.createGain();
-      scene.gainNode.connect(scene.audioContext.destination);
-      scene.gainNode.gain.value = 0.3;
-    } catch {
-      return;
-    }
+    // Lazily create the shared audio context via AudioSystem.
+    if (!scene.audioSystem.ensureContext()) return;
   }
 
   const ctx = scene.audioContext;
+  if (!ctx) return;
   const now = ctx.currentTime;
 
   // Randomize pitch slightly for variety
