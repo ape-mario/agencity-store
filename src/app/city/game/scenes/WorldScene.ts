@@ -17,6 +17,7 @@ import { AudioSystem } from "../systems/AudioSystem";
 import { TooltipSystem } from "../systems/TooltipSystem";
 import { EventEffectSystem } from "../systems/EventEffectSystem";
 import { SkySystem } from "../systems/SkySystem";
+import { DecorationSystem } from "../systems/DecorationSystem";
 import {
   setupTrendingZone,
   clearTrafficTimers,
@@ -142,6 +143,10 @@ export class WorldScene extends Phaser.Scene {
   /** Celebrations, fireworks, coin rain, announcements, bot-effect dispatch. */
   public eventEffectSystem: EventEffectSystem = new EventEffectSystem(this);
 
+  /** Ambient life + particles: decorations, clouds, animals, Pokémon, beach
+   *  creatures, fountain, pollen, fireflies. */
+  public decorationSystem: DecorationSystem = new DecorationSystem(this);
+
   /** Sky gradient, stars, time-of-day palette, sun/moon, weather effects.
    *  Constructed in create() once the day/night overlay exists. */
   public skySystem!: SkySystem;
@@ -149,6 +154,25 @@ export class WorldScene extends Phaser.Scene {
   /** Passthrough so zone setup files can call scene.restoreNormalSky(). */
   public restoreNormalSky(): void {
     this.skySystem.restoreNormalSky();
+  }
+
+  // ── Decoration passthroughs ─────────────────────────────────────────────
+  // React (GameCanvas.tsx) and zone setup files call these on the scene; they
+  // delegate to DecorationSystem, which owns the ambient-life methods.
+  moveAnimalTo(animalType: Animal["type"], targetX: number): void {
+    this.decorationSystem.moveAnimalTo(animalType, targetX);
+  }
+  petAnimal(animalType: Animal["type"]): void {
+    this.decorationSystem.petAnimal(animalType);
+  }
+  scareAnimal(animalType: Animal["type"]): void {
+    this.decorationSystem.scareAnimal(animalType);
+  }
+  callAnimal(animalType: Animal["type"], targetX: number): void {
+    this.decorationSystem.callAnimal(animalType, targetX);
+  }
+  petPokemon(pokemonType: Pokemon["type"]): void {
+    this.decorationSystem.petPokemon(pokemonType);
   }
 
   // Store bound event handlers for cleanup
@@ -359,23 +383,17 @@ export class WorldScene extends Phaser.Scene {
     // Paint the initial night ground transition (was previously in createGround).
     this.skySystem.drawGroundTransition("night");
 
-    // Add decorations (trees, bushes, benches, lamps)
-    this.createDecorations();
-
-    // Add extra decorations (flowers, rocks, fountain)
-    this.createExtraDecorations();
-
-    // Initialize clouds
-    this.createClouds();
-
-    // Add animals to the world
-    this.createAnimals();
+    // Decorations, clouds, animals, ambient particles (DecorationSystem).
+    this.decorationSystem.createDecorations();
+    this.decorationSystem.createExtraDecorations();
+    this.decorationSystem.createClouds();
+    this.decorationSystem.createAnimals();
 
     // Store original positions of decorations and animals for zone transitions
     this.storeOriginalPositions();
 
     // Create ambient particles (pollen/leaves)
-    this.createAmbientParticles();
+    this.decorationSystem.createAmbientParticles();
 
     // Add subtle ground animation
     this.tweens.add({
@@ -394,11 +412,11 @@ export class WorldScene extends Phaser.Scene {
     window.addEventListener("agencity-bot-effect", this.boundBotEffect);
 
     // Listen for bot animal commands
-    this.boundBotAnimal = (e: Event) => this.handleBotAnimal(e as CustomEvent);
+    this.boundBotAnimal = (e: Event) => this.decorationSystem.handleBotAnimal(e as CustomEvent);
     window.addEventListener("agencity-bot-animal", this.boundBotAnimal);
 
     // Listen for bot pokemon commands (Founders zone)
-    this.boundBotPokemon = (e: Event) => this.handleBotPokemon(e as CustomEvent);
+    this.boundBotPokemon = (e: Event) => this.decorationSystem.handleBotPokemon(e as CustomEvent);
     window.addEventListener("agencity-bot-pokemon", this.boundBotPokemon);
 
     // Listen for zone change events
@@ -3499,397 +3517,6 @@ export class WorldScene extends Phaser.Scene {
     this.groundTransition.setDepth(-0.5);
   }
 
-  private createDecorations(): void {
-    // Ground reference for positioning (top of grass area)
-    const grassTop = Y.GRASS_TOP;
-    const pathLevel = Y.PATH_LEVEL;
-
-    // Add trees (positioned at grass top level)
-    const treePositions = [
-      { x: Math.round(50 * SCALE), y: grassTop },
-      { x: Math.round(750 * SCALE), y: grassTop - Math.round(5 * SCALE) },
-      { x: Math.round(180 * SCALE), y: grassTop + Math.round(10 * SCALE) },
-      { x: Math.round(620 * SCALE), y: grassTop + Math.round(5 * SCALE) },
-    ];
-
-    treePositions.forEach((pos, i) => {
-      const tree = this.add.sprite(pos.x, pos.y, "tree");
-      tree.setOrigin(0.5, 1);
-      tree.setDepth(2);
-      tree.setScale((0.9 + Math.random() * 0.3) * SCALE);
-      this.decorations.push(tree);
-
-      // Gentle sway animation
-      this.tweens.add({
-        targets: tree,
-        angle: 2,
-        duration: 2000 + i * 500,
-        yoyo: true,
-        repeat: -1,
-        ease: "Sine.easeInOut",
-      });
-    });
-
-    // Add bushes (positioned on grass)
-    const bushPositions = [
-      { x: Math.round(100 * SCALE), y: grassTop + Math.round(25 * SCALE) },
-      { x: Math.round(300 * SCALE), y: grassTop + Math.round(20 * SCALE) },
-      { x: Math.round(500 * SCALE), y: grassTop + Math.round(23 * SCALE) },
-      { x: Math.round(700 * SCALE), y: grassTop + Math.round(21 * SCALE) },
-    ];
-
-    bushPositions.forEach((pos) => {
-      const bush = this.add.sprite(pos.x, pos.y, "bush");
-      bush.setOrigin(0.5, 1);
-      bush.setDepth(2);
-      bush.setScale((0.7 + Math.random() * 0.3) * SCALE);
-      this.decorations.push(bush);
-    });
-
-    // Add lamp posts (positioned near path)
-    const lampPositions = [
-      { x: Math.round(200 * SCALE), y: pathLevel },
-      { x: Math.round(600 * SCALE), y: pathLevel },
-    ];
-
-    lampPositions.forEach((pos) => {
-      const lamp = this.add.sprite(pos.x, pos.y, "lamp");
-      lamp.setOrigin(0.5, 1);
-      lamp.setDepth(3);
-      this.decorations.push(lamp);
-
-      // Add light glow (scaled)
-      const glow = this.add.sprite(pos.x, pos.y - Math.round(30 * SCALE), "glow");
-      glow.setAlpha(0.3);
-      glow.setScale(0.8 * SCALE);
-      glow.setDepth(2);
-      glow.setTint(0xfbbf24);
-
-      this.tweens.add({
-        targets: glow,
-        alpha: 0.5,
-        scale: 0.9 * SCALE,
-        duration: 1500,
-        yoyo: true,
-        repeat: -1,
-      });
-    });
-
-    // Add benches (positioned near path)
-    const benchPositions = [
-      { x: Math.round(350 * SCALE), y: pathLevel - Math.round(5 * SCALE) },
-      { x: Math.round(450 * SCALE), y: pathLevel - Math.round(5 * SCALE) },
-    ];
-
-    benchPositions.forEach((pos) => {
-      const bench = this.add.sprite(pos.x, pos.y, "bench");
-      bench.setOrigin(0.5, 1);
-      bench.setDepth(3);
-      this.decorations.push(bench);
-    });
-  }
-
-  private createClouds(): void {
-    for (let i = 0; i < 6; i++) {
-      const cloud = this.add.sprite(
-        Math.random() * GAME_WIDTH * 1.1 - Math.round(50 * SCALE),
-        Math.round(30 * SCALE) + Math.random() * Math.round(120 * SCALE),
-        "cloud"
-      );
-      cloud.setAlpha(0.5 + Math.random() * 0.3);
-      cloud.setScale((0.6 + Math.random() * 0.5) * SCALE);
-      cloud.setDepth(1);
-      this.clouds.push(cloud);
-    }
-  }
-
-  private createAnimals(): void {
-    const animalTypes: Animal["type"][] = ["dog", "cat", "bird", "butterfly", "squirrel"];
-
-    // Reference positions
-    const pathLevel = Y.PATH_LEVEL;
-    const grassTop = Y.GRASS_TOP;
-
-    // Create a variety of animals (positioned relative to ground)
-    const animalConfigs = [
-      {
-        type: "dog" as const,
-        x: Math.round(150 * SCALE),
-        y: pathLevel + Math.round(10 * SCALE),
-        scale: 1.2 * SCALE,
-      },
-      {
-        type: "cat" as const,
-        x: Math.round(650 * SCALE),
-        y: pathLevel + Math.round(10 * SCALE),
-        scale: 1.1 * SCALE,
-      },
-      {
-        type: "bird" as const,
-        x: Math.round(100 * SCALE),
-        y: grassTop - Math.round(20 * SCALE),
-        scale: 0.8 * SCALE,
-      },
-      {
-        type: "bird" as const,
-        x: Math.round(700 * SCALE),
-        y: grassTop - Math.round(10 * SCALE),
-        scale: 0.7 * SCALE,
-      },
-      {
-        type: "butterfly" as const,
-        x: Math.round(300 * SCALE),
-        y: grassTop - Math.round(30 * SCALE),
-        scale: 0.6 * SCALE,
-      },
-      {
-        type: "butterfly" as const,
-        x: Math.round(500 * SCALE),
-        y: grassTop - Math.round(40 * SCALE),
-        scale: 0.5 * SCALE,
-      },
-      {
-        type: "squirrel" as const,
-        x: Math.round(80 * SCALE),
-        y: grassTop + Math.round(20 * SCALE),
-        scale: 1.0 * SCALE,
-      },
-    ];
-
-    animalConfigs.forEach((config) => {
-      const sprite = this.add.sprite(config.x, config.y, config.type);
-      sprite.setScale(config.scale);
-      sprite.setDepth(4);
-
-      // Flying animals have higher depth
-      if (config.type === "bird" || config.type === "butterfly") {
-        sprite.setDepth(15);
-      }
-
-      const animal: Animal = {
-        sprite,
-        type: config.type,
-        targetX: config.x + (Math.random() * Math.round(200 * SCALE) - Math.round(100 * SCALE)),
-        speed:
-          config.type === "butterfly"
-            ? 0.3 * SCALE
-            : config.type === "bird"
-              ? 0.5 * SCALE
-              : 0.2 * SCALE,
-        direction: Math.random() > 0.5 ? "left" : "right",
-        idleTimer: 0,
-        isIdle: Math.random() > 0.5,
-      };
-
-      this.animals.push(animal);
-
-      // Add idle animation for ground animals (scaled movement)
-      if (config.type !== "bird" && config.type !== "butterfly") {
-        this.tweens.add({
-          targets: sprite,
-          y: config.y - Math.round(2 * SCALE),
-          duration: 500 + Math.random() * 300,
-          yoyo: true,
-          repeat: -1,
-          ease: "Sine.easeInOut",
-        });
-      }
-
-      // Flying animation for birds and butterflies (scaled movement)
-      if (config.type === "bird") {
-        this.tweens.add({
-          targets: sprite,
-          y: config.y - Math.round(15 * SCALE),
-          duration: 800 + Math.random() * 400,
-          yoyo: true,
-          repeat: -1,
-          ease: "Sine.easeInOut",
-        });
-      }
-
-      if (config.type === "butterfly") {
-        this.tweens.add({
-          targets: sprite,
-          y: config.y - Math.round(20 * SCALE),
-          angle: 5,
-          duration: 600 + Math.random() * 300,
-          yoyo: true,
-          repeat: -1,
-          ease: "Sine.easeInOut",
-        });
-      }
-    });
-  }
-
-  private createExtraDecorations(): void {
-    // Reference positions
-    const grassTop = Y.GRASS_TOP;
-    const pathLevel = Y.PATH_LEVEL;
-
-    // Add flower patches (positioned on grass)
-    const flowerPositions = [
-      { x: Math.round(130 * SCALE), y: grassTop + Math.round(35 * SCALE) },
-      { x: Math.round(280 * SCALE), y: grassTop + Math.round(30 * SCALE) },
-      { x: Math.round(420 * SCALE), y: grassTop + Math.round(33 * SCALE) },
-      { x: Math.round(560 * SCALE), y: grassTop + Math.round(27 * SCALE) },
-      { x: Math.round(680 * SCALE), y: grassTop + Math.round(31 * SCALE) },
-    ];
-
-    flowerPositions.forEach((pos) => {
-      const flower = this.add.sprite(pos.x, pos.y, "flower");
-      flower.setOrigin(0.5, 1);
-      flower.setDepth(2);
-      flower.setScale((0.8 + Math.random() * 0.4) * SCALE);
-      this.decorations.push(flower);
-
-      // Gentle sway
-      this.tweens.add({
-        targets: flower,
-        angle: 3,
-        duration: 1500 + Math.random() * 500,
-        yoyo: true,
-        repeat: -1,
-        ease: "Sine.easeInOut",
-      });
-    });
-
-    // Add rocks (positioned near path)
-    const rockPositions = [
-      { x: Math.round(70 * SCALE), y: pathLevel + Math.round(5 * SCALE) },
-      { x: Math.round(730 * SCALE), y: pathLevel + Math.round(2 * SCALE) },
-      { x: Math.round(380 * SCALE), y: pathLevel + Math.round(8 * SCALE) },
-    ];
-
-    rockPositions.forEach((pos) => {
-      const rock = this.add.sprite(pos.x, pos.y, "rock");
-      rock.setOrigin(0.5, 1);
-      rock.setDepth(2);
-      rock.setScale((0.6 + Math.random() * 0.3) * SCALE);
-      this.decorations.push(rock);
-    });
-
-    // Add fountain in center of park (above the path)
-    const fountainY = grassTop + Math.round(30 * SCALE);
-    const fountainX = GAME_WIDTH / 2;
-    const fountain = this.add.sprite(fountainX, fountainY, "fountain");
-    fountain.setOrigin(0.5, 1);
-    fountain.setDepth(2);
-    fountain.setScale(SCALE);
-    this.decorations.push(fountain);
-
-    // Water spray particles - aligned with fountain top
-    this.fountainWater = this.add.particles(fountainX, fountainY - Math.round(35 * SCALE), "rain", {
-      speed: { min: Math.round(30 * SCALE), max: Math.round(60 * SCALE) },
-      angle: { min: 260, max: 280 },
-      lifespan: 500,
-      quantity: 3,
-      frequency: 80,
-      scale: { start: 0.4 * SCALE, end: 0.1 * SCALE },
-      alpha: { start: 0.7, end: 0 },
-      gravityY: Math.round(80 * SCALE),
-      tint: 0x60a5fa, // Blue tint for water
-    });
-    this.fountainWater.setDepth(2);
-
-    // Add flag poles (positioned at skyline/grass transition)
-    const flagY = grassTop - Math.round(20 * SCALE);
-    const flagPositions = [
-      { x: Math.round(50 * SCALE), y: flagY },
-      { x: Math.round(750 * SCALE), y: flagY },
-    ];
-    flagPositions.forEach((pos) => {
-      const flag = this.add.sprite(pos.x, pos.y, "flag");
-      flag.setOrigin(0.5, 1);
-      flag.setDepth(1);
-      this.decorations.push(flag);
-
-      // Flag waving
-      this.tweens.add({
-        targets: flag,
-        scaleX: 0.9 * SCALE,
-        duration: 800,
-        yoyo: true,
-        repeat: -1,
-        ease: "Sine.easeInOut",
-      });
-    });
-
-    // Add pond in corner (positioned on grass)
-    const pond = this.add.sprite(
-      Math.round(100 * SCALE),
-      grassTop + Math.round(50 * SCALE),
-      "pond"
-    );
-    pond.setOrigin(0.5, 0.5);
-    pond.setDepth(0);
-    pond.setScale(1.5 * SCALE);
-    pond.setAlpha(0.8);
-    this.decorations.push(pond);
-
-    // Ripple effect on pond (scaled)
-    this.tweens.add({
-      targets: pond,
-      scale: 1.55 * SCALE,
-      alpha: 0.6,
-      duration: 2000,
-      yoyo: true,
-      repeat: -1,
-      ease: "Sine.easeInOut",
-    });
-  }
-
-  private createAmbientParticles(): void {
-    // Floating pollen/dust particles during day (scaled)
-    this.ambientParticles = this.add.particles(GAME_WIDTH / 2, Math.round(200 * SCALE), "pollen", {
-      x: { min: 0, max: GAME_WIDTH },
-      y: { min: Math.round(100 * SCALE), max: Math.round(400 * SCALE) },
-      lifespan: 8000,
-      speedX: { min: Math.round(5 * SCALE), max: Math.round(20 * SCALE) },
-      speedY: { min: Math.round(-5 * SCALE), max: Math.round(5 * SCALE) },
-      scale: { start: 0.3 * SCALE, end: 0 },
-      alpha: { start: 0.4, end: 0 },
-      quantity: 1,
-      frequency: 500,
-    });
-    this.ambientParticles.setDepth(15);
-  }
-
-  private createFireflies(): void {
-    if (this.fireflies) return;
-
-    this.fireflies = this.add.particles(GAME_WIDTH / 2, Math.round(400 * SCALE), "firefly", {
-      x: { min: Math.round(50 * SCALE), max: Math.round(750 * SCALE) },
-      y: { min: Math.round(350 * SCALE), max: Math.round(500 * SCALE) },
-      lifespan: 4000,
-      speedX: { min: Math.round(-20 * SCALE), max: Math.round(20 * SCALE) },
-      speedY: { min: Math.round(-20 * SCALE), max: Math.round(20 * SCALE) },
-      scale: { start: 0.8 * SCALE, end: 0 },
-      alpha: { start: 0, end: 1, ease: "Sine.easeInOut" },
-      quantity: 1,
-      frequency: 300,
-      tint: 0xffff00,
-      blendMode: Phaser.BlendModes.ADD,
-    });
-    this.fireflies.setDepth(20);
-  }
-
-  public showFireflies(): void {
-    if (!this.fireflies) {
-      this.createFireflies();
-    } else {
-      this.fireflies.start();
-      this.fireflies.setVisible(true);
-    }
-  }
-
-  public hideFireflies(): void {
-    if (this.fireflies) {
-      this.fireflies.stop();
-      this.fireflies.setVisible(false);
-    }
-  }
-
-
   update(): void {
     // Phase 0 culling: pause ambient work entirely while a popup covers the
     // canvas or the tab is hidden. Local-player input is already gated inside
@@ -3998,160 +3625,9 @@ export class WorldScene extends Phaser.Scene {
       }
     });
 
-    // Animate clouds with parallax — Phase 0 culling: pause when a modal is
-    // open or the tab is hidden (Phaser already throttles hidden tabs, but the
-    // modal case is not otherwise covered).
-    if (!modalOpen && !tabHidden) {
-      this.clouds.forEach((cloud, i) => {
-        cloud.x += 0.15 + i * 0.05;
-        if (cloud.x > 870) {
-          cloud.x = -70;
-          cloud.y = 30 + Math.random() * 120;
-        }
-      });
-    }
-
-    // Ambient animals only populate main_city, so a zone guard drops the
-    // cross-zone cost to ~zero.
-    if (this.currentZone === "main_city") {
-    // Animate animals (scaled for 1280x960 resolution)
-    const animalMinX = Math.round(50 * SCALE);
-    const animalMaxX = Math.round(750 * SCALE);
-    const animalRoamRange = Math.round(700 * SCALE);
-
-    this.animals.forEach((animal) => {
-      if (animal.isIdle) {
-        animal.idleTimer += 1;
-        // After idle period, start moving again
-        if (animal.idleTimer > 100 + Math.random() * 200) {
-          animal.isIdle = false;
-          animal.idleTimer = 0;
-          animal.targetX = animalMinX + Math.random() * animalRoamRange;
-          animal.direction = animal.targetX > animal.sprite.x ? "right" : "left";
-        }
-      } else {
-        // Move toward target
-        const dx = animal.targetX - animal.sprite.x;
-        if (Math.abs(dx) < 5 * SCALE) {
-          // Reached target, become idle
-          animal.isIdle = true;
-        } else {
-          animal.sprite.x += animal.speed * (dx > 0 ? 1 : -1);
-          animal.sprite.setFlipX(dx < 0);
-        }
-
-        // Keep within bounds (scaled)
-        if (animal.sprite.x < animalMinX) {
-          animal.sprite.x = animalMinX;
-          animal.targetX = animalMinX + Math.random() * Math.round(300 * SCALE);
-        }
-        if (animal.sprite.x > animalMaxX) {
-          animal.sprite.x = animalMaxX;
-          animal.targetX = Math.round(400 * SCALE) + Math.random() * Math.round(350 * SCALE);
-        }
-      }
-    });
-    } // end main_city animal loop guard
-
-    // === POKEMON MOVEMENT (Founders zone only) ===
-    if (this.currentZone === "founders") {
-      const pokemonMinX = Math.round(80 * SCALE);
-      const pokemonMaxX = Math.round(720 * SCALE);
-
-      this.pokemon.forEach((poke) => {
-        if (!poke.sprite.active) return;
-
-        if (!poke.isIdle) {
-          // Move toward target
-          const dx = poke.targetX - poke.sprite.x;
-          if (Math.abs(dx) < 5 * SCALE) {
-            // Reached target, become idle
-            poke.isIdle = true;
-            poke.idleTimer = 0;
-          } else {
-            poke.sprite.x += poke.speed * SCALE * (dx > 0 ? 1 : -1);
-            poke.sprite.setFlipX(dx < 0);
-          }
-
-          // Keep within bounds
-          if (poke.sprite.x < pokemonMinX) {
-            poke.sprite.x = pokemonMinX;
-            poke.isIdle = true;
-            poke.targetX = pokemonMinX + Math.random() * Math.round(200 * SCALE);
-          }
-          if (poke.sprite.x > pokemonMaxX) {
-            poke.sprite.x = pokemonMaxX;
-            poke.isIdle = true;
-            poke.targetX = pokemonMaxX - Math.random() * Math.round(200 * SCALE);
-          }
-        }
-      });
-    }
-
-    // === BEACH CRAB/LOBSTER MOVEMENT (Moltbook Beach zone only) ===
-    if (this.currentZone === "moltbook") {
-      const crabMinX = Math.round(60 * SCALE);
-      const crabMaxX = Math.round(740 * SCALE);
-      const crabRoamRange = Math.round(600 * SCALE);
-
-      // Helper to update a single crab/lobster/hermit creature movement
-      const updateCreatureMovement = (crab: BeachCrab) => {
-        if (!crab.sprite || !crab.sprite.active) return;
-
-        if (crab.isIdle) {
-          crab.idleTimer += 1;
-
-          // Idle claw snap: random chance for a quick scale pulse (visual "snap")
-          if (crab.idleTimer % 60 === 0 && Math.random() < 0.08) {
-            this.tweens.add({
-              targets: crab.sprite,
-              scaleX: crab.sprite.scaleX * 1.15,
-              scaleY: crab.sprite.scaleY * 1.12,
-              duration: 100,
-              yoyo: true,
-              ease: "Quad.easeOut",
-            });
-          }
-
-          // Crabs idle longer than regular animals - they're chill beach vibes
-          if (crab.idleTimer > 150 + Math.random() * 250) {
-            crab.isIdle = false;
-            crab.idleTimer = 0;
-            crab.targetX = crabMinX + Math.random() * crabRoamRange;
-            crab.direction = crab.targetX > crab.sprite.x ? "right" : "left";
-          }
-        } else {
-          // Move toward target (crabs are slower, more deliberate)
-          const dx = crab.targetX - crab.sprite.x;
-          if (Math.abs(dx) < 5 * SCALE) {
-            // Reached target, become idle
-            crab.isIdle = true;
-            crab.idleTimer = 0;
-          } else {
-            crab.sprite.x += crab.speed * (dx > 0 ? 1 : -1);
-            crab.sprite.setFlipX(dx < 0);
-          }
-
-          // Keep within beach bounds
-          if (crab.sprite.x < crabMinX) {
-            crab.sprite.x = crabMinX;
-            crab.targetX = crabMinX + Math.random() * Math.round(200 * SCALE);
-            crab.isIdle = true;
-          }
-          if (crab.sprite.x > crabMaxX) {
-            crab.sprite.x = crabMaxX;
-            crab.targetX = crabMaxX - Math.random() * Math.round(200 * SCALE);
-            crab.isIdle = true;
-          }
-        }
-      };
-
-      // Update external agent crabs/lobsters
-      this.beachCrabs.forEach(updateCreatureMovement);
-
-      // Update ambient creatures (always-present beach life)
-      this.ambientCreatures.forEach(updateCreatureMovement);
-    }
+    // Cloud parallax + ambient creature roaming now lives in DecorationSystem
+    // (with the Phase 0 culling guards folded in).
+    this.decorationSystem.update(modalOpen, tabHidden);
   }
 
   updateWorldState(state: WorldState): void {
@@ -5483,277 +4959,6 @@ export class WorldScene extends Phaser.Scene {
 
 
   // Animal control methods for City Bot (scaled positions)
-  moveAnimalTo(animalType: Animal["type"], targetX: number): void {
-    const animal = this.animals.find((a) => a.type === animalType);
-    if (animal) {
-      animal.targetX = Math.max(Math.round(50 * SCALE), Math.min(Math.round(750 * SCALE), targetX));
-      animal.isIdle = false;
-      animal.direction = animal.targetX > animal.sprite.x ? "right" : "left";
-    }
-  }
-
-  petAnimal(animalType: Animal["type"]): void {
-    const animal = this.animals.find((a) => a.type === animalType);
-    if (animal) {
-      // Stop the animal
-      animal.isIdle = true;
-      animal.idleTimer = 0;
-
-      // Happy bounce animation (scaled)
-      this.tweens.add({
-        targets: animal.sprite,
-        y: animal.sprite.y - Math.round(15 * SCALE),
-        duration: 200,
-        yoyo: true,
-        repeat: 2,
-        ease: "Bounce.easeOut",
-      });
-
-      // Hearts effect (scaled)
-      const hearts = this.add.particles(
-        animal.sprite.x,
-        animal.sprite.y - Math.round(20 * SCALE),
-        "star",
-        {
-          speed: { min: Math.round(30 * SCALE), max: Math.round(60 * SCALE) },
-          angle: { min: 220, max: 320 },
-          lifespan: 1000,
-          quantity: 5,
-          scale: { start: 0.5 * SCALE, end: 0 },
-          alpha: { start: 1, end: 0 },
-          tint: 0xff69b4,
-        }
-      );
-
-      hearts.explode(5);
-
-      this.time.delayedCall(1000, () => {
-        hearts.destroy();
-      });
-    }
-  }
-
-  scareAnimal(animalType: Animal["type"]): void {
-    const animal = this.animals.find((a) => a.type === animalType);
-    if (animal) {
-      // Run away to random side (scaled)
-      animal.isIdle = false;
-      animal.targetX =
-        animal.sprite.x > GAME_WIDTH / 2 ? Math.round(50 * SCALE) : Math.round(750 * SCALE);
-      animal.speed = animal.speed * 3; // Temporarily faster
-
-      // Shake animation (scaled)
-      this.tweens.add({
-        targets: animal.sprite,
-        x: animal.sprite.x + Math.round(5 * SCALE),
-        duration: 50,
-        yoyo: true,
-        repeat: 4,
-      });
-
-      // Reset speed after 2 seconds (scaled)
-      this.time.delayedCall(2000, () => {
-        animal.speed =
-          animal.type === "butterfly"
-            ? 0.3 * SCALE
-            : animal.type === "bird"
-              ? 0.5 * SCALE
-              : 0.2 * SCALE;
-      });
-    }
-  }
-
-  callAnimal(animalType: Animal["type"], targetX: number): void {
-    const animal = this.animals.find((a) => a.type === animalType);
-    if (animal) {
-      animal.targetX = Math.max(Math.round(50 * SCALE), Math.min(Math.round(750 * SCALE), targetX));
-      animal.isIdle = false;
-      animal.direction = animal.targetX > animal.sprite.x ? "right" : "left";
-      animal.speed = animal.speed * 1.5; // Move a bit faster when called
-
-      // Reset speed after reaching target (scaled)
-      this.time.delayedCall(3000, () => {
-        animal.speed = animal.type === "butterfly" ? 0.3 : animal.type === "bird" ? 0.5 : 0.2;
-      });
-    }
-  }
-
-  getAnimalPosition(animalType: Animal["type"]): { x: number; y: number } | null {
-    const animal = this.animals.find((a) => a.type === animalType);
-    if (animal) {
-      return { x: animal.sprite.x, y: animal.sprite.y };
-    }
-    return null;
-  }
-
-  getAllAnimals(): Array<{ type: Animal["type"]; x: number; y: number; isIdle: boolean }> {
-    return this.animals.map((a) => ({
-      type: a.type,
-      x: a.sprite.x,
-      y: a.sprite.y,
-      isIdle: a.isIdle,
-    }));
-  }
-
-  // ===========================================
-  // BOT EFFECT HANDLERS
-  // ===========================================
-
-  private handleBotAnimal(event: CustomEvent): void {
-    const { animalType, animalAction } = event.detail || {};
-
-    if (!animalType) return;
-
-    switch (animalAction) {
-      case "pet":
-        this.petAnimal(animalType);
-        break;
-      case "scare":
-      case "chase": // Chase is similar to scare
-        this.scareAnimal(animalType);
-        break;
-      case "call":
-        this.callAnimal(animalType, GAME_WIDTH / 2); // Call to center
-        break;
-      case "feed":
-        this.feedAnimal(animalType);
-        break;
-      default:
-        this.petAnimal(animalType); // Default to pet
-    }
-  }
-
-  private handleBotPokemon(event: CustomEvent): void {
-    const { pokemonType, pokemonAction } = event.detail || {};
-
-    if (!pokemonType) return;
-
-    switch (pokemonAction) {
-      case "pet":
-      case "play":
-        this.petPokemon(pokemonType);
-        break;
-      case "call":
-        this.callPokemon(pokemonType);
-        break;
-      default:
-        this.petPokemon(pokemonType);
-    }
-  }
-
-  // Pet/play with a Pokemon - happy reaction with particles
-  petPokemon(pokemonType: Pokemon["type"]): void {
-    const poke = this.pokemon.find((p) => p.type === pokemonType);
-    if (!poke || !poke.sprite.active) return;
-
-    // Stop moving and react happily
-    poke.isIdle = true;
-    poke.idleTimer = 0;
-
-    // Happy jump animation
-    this.tweens.add({
-      targets: poke.sprite,
-      y: poke.baseY - Math.round(20 * SCALE),
-      scaleX: poke.sprite.scaleX * 1.15,
-      scaleY: poke.sprite.scaleY * 0.85,
-      duration: 150,
-      yoyo: true,
-      repeat: 2,
-      ease: "Bounce.easeOut",
-      onComplete: () => {
-        poke.sprite.y = poke.baseY;
-      },
-    });
-
-    // Happy particles (hearts and stars)
-    const particles = this.add.particles(
-      poke.sprite.x,
-      poke.sprite.y - Math.round(15 * SCALE),
-      "star",
-      {
-        speed: { min: Math.round(30 * SCALE), max: Math.round(80 * SCALE) },
-        angle: { min: 200, max: 340 },
-        lifespan: 1000,
-        quantity: 8,
-        scale: { start: 0.6 * SCALE, end: 0 },
-        alpha: { start: 1, end: 0 },
-        tint: [0xffcc00, 0xff6699, 0x66ffcc], // Gold, pink, teal for Pokemon vibes
-        gravityY: Math.round(-20 * SCALE),
-      }
-    );
-
-    particles.explode(8);
-
-    this.time.delayedCall(1200, () => {
-      particles.destroy();
-    });
-
-    // Screen flash for extra feedback
-    this.cameras.main.flash(100, 255, 255, 200, true);
-  }
-
-  // Call a Pokemon - make it come to center
-  callPokemon(pokemonType: Pokemon["type"]): void {
-    const poke = this.pokemon.find((p) => p.type === pokemonType);
-    if (!poke || !poke.sprite.active) return;
-
-    // Move to center
-    poke.isIdle = false;
-    poke.targetX = GAME_WIDTH / 2;
-    poke.direction = poke.targetX > poke.sprite.x ? "right" : "left";
-
-    // Little attention animation
-    this.tweens.add({
-      targets: poke.sprite,
-      angle: { from: -5, to: 5 },
-      duration: 100,
-      yoyo: true,
-      repeat: 2,
-    });
-  }
-
-  // Feed animal - similar to pet but with food particle (scaled)
-  feedAnimal(animalType: Animal["type"]): void {
-    const animal = this.animals.find((a) => a.type === animalType);
-    if (animal) {
-      // Stop the animal
-      animal.isIdle = true;
-      animal.idleTimer = 0;
-
-      // Eating animation - bounce and grow slightly
-      this.tweens.add({
-        targets: animal.sprite,
-        scaleX: animal.sprite.scaleX * 1.1,
-        scaleY: animal.sprite.scaleY * 1.1,
-        duration: 200,
-        yoyo: true,
-        repeat: 2,
-        ease: "Bounce.easeOut",
-      });
-
-      // Food particles (using star as food, scaled)
-      const food = this.add.particles(
-        animal.sprite.x,
-        animal.sprite.y - Math.round(10 * SCALE),
-        "star",
-        {
-          speed: { min: Math.round(10 * SCALE), max: Math.round(30 * SCALE) },
-          angle: { min: 220, max: 320 },
-          lifespan: 800,
-          quantity: 3,
-          scale: { start: 0.3 * SCALE, end: 0 },
-          alpha: { start: 1, end: 0 },
-          tint: 0xffd700,
-        }
-      );
-
-      food.explode(3);
-
-      this.time.delayedCall(800, () => {
-        food.destroy();
-      });
-    }
-  }
 
   // Fireworks effect - multiple bursts in the sky (scaled)
   // Character walking system with activity variety
