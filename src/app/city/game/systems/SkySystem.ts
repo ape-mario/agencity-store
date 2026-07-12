@@ -768,7 +768,7 @@ export class SkySystem {
       alpha = 0.45;
       tint = 0x0a0a2e;
       // Show fireflies at night (created once, then toggled)
-      this.scene.showFireflies();
+      this.scene.decorationSystem.showFireflies();
       // Hide ambient particles at night
       if (this.scene.ambientParticles) {
         this.scene.ambientParticles.stop();
@@ -779,13 +779,13 @@ export class SkySystem {
       alpha = 0.25;
       tint = 0x4a2a3e;
       // Start showing some fireflies at dusk
-      this.scene.showFireflies();
+      this.scene.decorationSystem.showFireflies();
     } else if (timeInfo.isDawn) {
       // Dawn (6 AM to 8 AM EST) - soft golden
       alpha = 0.2;
       tint = 0x3a2a1e;
       // Hide fireflies at dawn
-      this.scene.hideFireflies();
+      this.scene.decorationSystem.hideFireflies();
       if (this.scene.ambientParticles) {
         this.scene.ambientParticles.start();
         this.scene.ambientParticles.setVisible(true);
@@ -793,7 +793,7 @@ export class SkySystem {
     } else {
       // Daytime - hide fireflies, show ambient particles
       if (wasNight || this.currentTimeInfo === null) {
-        this.scene.hideFireflies();
+        this.scene.decorationSystem.hideFireflies();
         if (this.scene.ambientParticles) {
           this.scene.ambientParticles.start();
           this.scene.ambientParticles.setVisible(true);

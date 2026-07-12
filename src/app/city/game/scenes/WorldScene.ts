@@ -21,6 +21,8 @@ import { DecorationSystem } from "../systems/DecorationSystem";
 import { CharacterSystem } from "../systems/CharacterSystem";
 import { BuildingSystem } from "../systems/BuildingSystem";
 import { EncounterSystem } from "../systems/EncounterSystem";
+import { AgentSystem } from "../systems/AgentSystem";
+import { DialogueSystem } from "../systems/DialogueSystem";
 import {
   setupTrendingZone,
   clearTrafficTimers,
@@ -159,6 +161,12 @@ export class WorldScene extends Phaser.Scene {
   /** Wild-creature encounter trigger + cooldown + stun glue. */
   public encounterSystem: EncounterSystem = new EncounterSystem(this);
 
+  /** Agent WebSocket glue: connect, world-state poll, command translation. */
+  public agentSystem: AgentSystem = new AgentSystem(this);
+
+  /** Character speech-bubble glue (autonomous dialogue + direct speak). */
+  public dialogueSystem: DialogueSystem = new DialogueSystem(this);
+
   /** Sky gradient, stars, time-of-day palette, sun/moon, weather effects.
    *  Constructed in create() once the day/night overlay exists. */
   public skySystem!: SkySystem;
@@ -264,20 +272,14 @@ export class WorldScene extends Phaser.Scene {
   public originalPositions: Map<Phaser.GameObjects.GameObject, number> = new Map(); // Store original X positions
 
   // Speech bubble manager for autonomous dialogue
-  private speechBubbleManager: SpeechBubbleManager | null = null;
-  private lastDialogueLine: string | null = null; // Track last line to avoid duplicates
+  public speechBubbleManager: SpeechBubbleManager | null = null;
 
   // AI-driven character behavior
-  private characterTargets: Map<string, { x: number; y: number; action: string }> = new Map();
+  public characterTargets: Map<string, { x: number; y: number; action: string }> = new Map();
   private boundBehaviorHandler: ((e: Event) => void) | null = null;
   private boundSpeakHandler: ((e: Event) => void) | null = null;
 
   // Agent server WebSocket connection
-  private agentSocket: WebSocket | null = null;
-  private agentReconnectAttempts = 0;
-  private readonly maxAgentReconnectAttempts = 5;
-  private worldStateUpdateTimer: Phaser.Time.TimerEvent | null = null;
-  private agentReconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // Performance: character lookup map for O(1) access in update loop
   private characterById: Map<string, GameCharacter> = new Map();
@@ -438,11 +440,11 @@ export class WorldScene extends Phaser.Scene {
     this.speechBubbleManager = new SpeechBubbleManager(this, this.characterSprites);
 
     // Listen for AI behavior commands
-    this.boundBehaviorHandler = (e: Event) => this.handleBehaviorCommand(e as CustomEvent);
+    this.boundBehaviorHandler = (e: Event) => this.agentSystem.handleBehaviorCommand(e as CustomEvent);
     window.addEventListener("agencity-character-behavior", this.boundBehaviorHandler);
 
     // Listen for character speak events
-    this.boundSpeakHandler = (e: Event) => this.handleCharacterSpeak(e as CustomEvent);
+    this.boundSpeakHandler = (e: Event) => this.dialogueSystem.handleCharacterSpeak(e as CustomEvent);
     window.addEventListener("agencity-character-speak", this.boundSpeakHandler);
 
     // Listen for encounter end events (from React overlay)
@@ -462,7 +464,7 @@ export class WorldScene extends Phaser.Scene {
     this.initTutorialListener();
 
     // Connect to agent server for bidirectional communication
-    this.connectToAgentServer();
+    this.agentSystem.connect();
 
     // Extract Phaser textures to data URLs for React battle overlay
     extractBattleTextures(this);
@@ -2805,55 +2807,6 @@ export class WorldScene extends Phaser.Scene {
   }
 
   // Handle AI behavior commands for characters
-  private handleBehaviorCommand(event: CustomEvent): void {
-    const command = event.detail;
-    if (!command || !command.characterId) return;
-
-    const characterId = command.characterId;
-    let targetX: number | undefined;
-    let targetY: number | undefined;
-
-    // Determine target position based on command
-    if (command.target) {
-      if (command.target.type === "position" && command.target.x !== undefined) {
-        targetX = command.target.x;
-        targetY = command.target.y || Math.round(570 * SCALE);
-      } else if (command.target.type === "character" && command.target.id) {
-        // Find target character's position
-        const targetSprite = this.findCharacterSprite(command.target.id);
-        if (targetSprite) {
-          // Move near the character, not exactly on top
-          const offset = (Math.random() - 0.5) * 100;
-          targetX = targetSprite.x + offset;
-          targetY = targetSprite.y + (Math.random() - 0.5) * 30;
-        }
-      } else if (command.target.type === "building" && command.target.id) {
-        // Find building position
-        const building = this.buildingSprites.get(command.target.id);
-        if (building) {
-          targetX = building.x + (Math.random() - 0.5) * 80;
-          targetY = Math.round(580 * SCALE); // Stay on path
-        }
-      }
-    }
-
-    // If we have a valid target, store it
-    if (targetX !== undefined && targetY !== undefined) {
-      // Clamp to valid bounds
-      targetX = Math.max(100, Math.min(1180, targetX));
-      targetY = Math.max(Math.round(450 * SCALE), Math.min(Math.round(620 * SCALE), targetY));
-
-      this.characterTargets.set(characterId, {
-        x: targetX,
-        y: targetY,
-        action: command.action || "moveTo",
-      });
-    } else if (command.action === "idle" || command.action === "observe") {
-      // Clear target for idle/observe
-      this.characterTargets.delete(characterId);
-    }
-  }
-
   // Find a character sprite by character ID (handles special character naming)
   public findCharacterSprite(characterId: string): Phaser.GameObjects.Sprite | null {
     // Direct lookup
@@ -3049,271 +3002,8 @@ export class WorldScene extends Phaser.Scene {
   }
 
   // Handle character speak events (from AI behavior)
-  private handleCharacterSpeak(event: CustomEvent): void {
-    const { characterId, message, emotion } = event.detail;
-    if (!characterId || !message || !this.speechBubbleManager) return;
-
-    // Sanitize: skip raw JSON/code strings that leak from AI responses
-    const msg = typeof message === "string" ? message : String(message);
-    if (
-      msg.startsWith("{") ||
-      msg.startsWith("[") ||
-      msg.startsWith("<") ||
-      msg.includes('"type"') ||
-      msg.includes("```")
-    )
-      return;
-
-    // Truncate overly long messages
-    const cleanMessage = msg.length > 120 ? msg.slice(0, 117) + "..." : msg;
-
-    // Don't interrupt autonomous dialogue conversations
-    const activeConversation = getActiveConversation();
-    if (activeConversation?.isActive) return;
-
-    // Create a dialogue line and show bubble
-    const line = {
-      characterId,
-      characterName: characterId,
-      message: cleanMessage,
-      timestamp: Date.now(),
-      emotion: emotion || "neutral",
-    };
-
-    this.speechBubbleManager.showBubble(line);
-  }
-
-  // Update speech bubbles for autonomous dialogue
-  private updateDialogueBubbles(): void {
-    if (!this.speechBubbleManager) return;
-
-    // Update bubble positions to follow characters
-    this.speechBubbleManager.update();
-
-    // Check for current dialogue line
-    const currentLine = getCurrentLine();
-
-    if (currentLine) {
-      // Skip raw JSON/code that leaks from AI responses
-      const msg = currentLine.message;
-      if (
-        msg.startsWith("{") ||
-        msg.startsWith("[") ||
-        msg.startsWith("<") ||
-        msg.includes('"type"') ||
-        msg.includes("```")
-      )
-        return;
-
-      // Create a unique ID for this line
-      const lineId = `${currentLine.characterId}-${currentLine.timestamp}-${msg.slice(0, 20)}`;
-
-      // Only show if it's a new line
-      if (lineId !== this.lastDialogueLine) {
-        this.lastDialogueLine = lineId;
-
-        // Update character sprites reference (in case they changed)
-        this.speechBubbleManager.setCharacterSprites(this.characterSprites);
-
-        // Truncate overly long messages
-        const sanitized = {
-          ...currentLine,
-          message: msg.length > 120 ? msg.slice(0, 117) + "..." : msg,
-        };
-
-        // Show the speech bubble
-        this.speechBubbleManager.showBubble(sanitized);
-      }
-    }
-  }
-
   // Cleanup method to prevent memory leaks
   // === AGENT SERVER WEBSOCKET ===
-
-  private connectToAgentServer(): void {
-    try {
-      // Allow configurable URL via window global or default to localhost:3001
-      const wsUrl =
-        (typeof window !== "undefined" && (window as any).__AGENTS_WS_URL) ||
-        "ws://localhost:3001/ws";
-
-      this.agentSocket = new WebSocket(wsUrl);
-
-      this.agentSocket.onopen = () => {
-        console.log("[WorldScene] Connected to agent server");
-        this.agentReconnectAttempts = 0;
-
-        // Start sending world state updates every 1 second
-        if (this.worldStateUpdateTimer) {
-          this.worldStateUpdateTimer.destroy();
-        }
-        this.worldStateUpdateTimer = this.time.addEvent({
-          delay: 1000,
-          callback: () => this.sendWorldStateUpdate(),
-          loop: true,
-        });
-      };
-
-      this.agentSocket.onmessage = (event: MessageEvent) => {
-        try {
-          const command = JSON.parse(event.data);
-          this.handleAgentCommand(command);
-        } catch (err) {
-          console.error("[WorldScene] Failed to parse agent message:", err);
-        }
-      };
-
-      this.agentSocket.onclose = () => {
-        console.log("[WorldScene] Agent server connection closed");
-        this.agentSocket = null;
-
-        // Stop the world state update timer when disconnected
-        if (this.worldStateUpdateTimer) {
-          this.worldStateUpdateTimer.destroy();
-          this.worldStateUpdateTimer = null;
-        }
-
-        this.scheduleAgentReconnect();
-      };
-
-      this.agentSocket.onerror = (err: Event) => {
-        // Log at debug level - agent server is optional
-        console.debug("[WorldScene] Agent server connection error:", err);
-      };
-    } catch (err) {
-      // Game works fine without the agent server
-      console.debug("[WorldScene] Could not connect to agent server:", err);
-      this.scheduleAgentReconnect();
-    }
-  }
-
-  private sendWorldStateUpdate(): void {
-    if (!this.agentSocket || this.agentSocket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    // Phase 0: pause outbound world-state updates while a popup is open — no
-    // visible motion to report, and skipping saves a full sprite-scan + WS send.
-    if (typeof window !== "undefined" && (window as any).__agencity_modal_open === true) {
-      return;
-    }
-
-    try {
-      // Build character states from current sprites
-      const characters: Record<string, { x: number; y: number; isMoving: boolean }> = {};
-
-      for (const [, sprite] of this.characterSprites) {
-        const spriteData = sprite as any;
-        let agentId: string | null = null;
-
-        // Map sprite flags to agent IDs (same pattern as findCharacterSprite)
-        if (spriteData.isFinn) agentId = "finn";
-        else if (spriteData.isDev) agentId = "ghost";
-        else if (spriteData.isScout) agentId = "neo";
-        else if (spriteData.isAsh) agentId = "ash";
-        else if (spriteData.isToly) agentId = "toly";
-        else if (spriteData.isCJ) agentId = "cj";
-        else if (spriteData.isShaw) agentId = "shaw";
-        else if (spriteData.isRamo) agentId = "ramo";
-        else if (spriteData.isSincara) agentId = "sincara";
-        else if (spriteData.isStuu) agentId = "stuu";
-        else if (spriteData.isSam) agentId = "sam";
-        else if (spriteData.isAlaa) agentId = "alaa";
-        else if (spriteData.isCarlo) agentId = "carlo";
-        else if (spriteData.isBNN) agentId = "bnn";
-        else if (spriteData.isProfessorOak) agentId = "professorOak";
-        else if (spriteData.isCityBot) agentId = "citybot";
-
-        if (agentId) {
-          characters[agentId] = {
-            x: sprite.x,
-            y: sprite.y,
-            isMoving: this.characterTargets.has(agentId),
-          };
-        }
-      }
-
-      const update = {
-        type: "world-state-update",
-        timestamp: Date.now(),
-        zone: this.currentZone,
-        characters,
-        weather: this.worldState?.weather || "cloudy",
-        health: this.worldState?.health || 50,
-      };
-
-      this.agentSocket.send(JSON.stringify(update));
-    } catch (err) {
-      console.error("[WorldScene] Failed to send world state update:", err);
-    }
-  }
-
-  private handleAgentCommand(command: any): void {
-    if (!command || !command.type) return;
-
-    try {
-      switch (command.type) {
-        case "character-behavior":
-          window.dispatchEvent(
-            new CustomEvent("agencity-character-behavior", {
-              detail: command,
-            })
-          );
-          break;
-
-        case "character-speak":
-          window.dispatchEvent(
-            new CustomEvent("agencity-character-speak", {
-              detail: {
-                characterId: command.characterId,
-                message: command.message,
-                emotion: command.emotion,
-              },
-            })
-          );
-          break;
-
-        case "zone-transition":
-          // Agent requested a zone change
-          if (command.target?.id) {
-            window.dispatchEvent(
-              new CustomEvent("agencity-zone-change", {
-                detail: { zone: command.target.id },
-              })
-            );
-          }
-          break;
-
-        case "pong":
-          // Heartbeat response, no action needed
-          break;
-
-        default:
-          console.debug("[WorldScene] Unknown agent command type:", command.type);
-      }
-    } catch (err) {
-      console.error("[WorldScene] Error handling agent command:", err);
-    }
-  }
-
-  private scheduleAgentReconnect(): void {
-    if (this.agentReconnectAttempts >= this.maxAgentReconnectAttempts) {
-      console.debug("[WorldScene] Max agent reconnect attempts reached, giving up");
-      return;
-    }
-
-    const delay = Math.min(1000 * Math.pow(2, this.agentReconnectAttempts), 30000);
-    this.agentReconnectAttempts++;
-
-    console.debug(
-      `[WorldScene] Scheduling agent reconnect in ${delay}ms (attempt ${this.agentReconnectAttempts}/${this.maxAgentReconnectAttempts})`
-    );
-
-    this.agentReconnectTimeout = setTimeout(() => {
-      this.agentReconnectTimeout = null;
-      this.connectToAgentServer();
-    }, delay);
-  }
 
   registerZonePopupBuilding(
     id: string,
@@ -3465,19 +3155,8 @@ export class WorldScene extends Phaser.Scene {
     this.characterTargets.clear();
 
     // Clean up agent server WebSocket
-    if (this.worldStateUpdateTimer) {
-      this.worldStateUpdateTimer.destroy();
-      this.worldStateUpdateTimer = null;
-    }
-    if (this.agentReconnectTimeout) {
-      clearTimeout(this.agentReconnectTimeout);
-      this.agentReconnectTimeout = null;
-    }
-    if (this.agentSocket) {
-      this.agentSocket.onclose = null; // Prevent reconnect on intentional close
-      this.agentSocket.close();
-      this.agentSocket = null;
-    }
+    // Tear down the agent WebSocket + reconnect/world-state timers.
+    this.agentSystem.cleanup();
 
     // Clean up beach crabs and ambient creatures
     this.beachCrabs = [];
@@ -3537,7 +3216,7 @@ export class WorldScene extends Phaser.Scene {
     // Update speech bubbles for autonomous dialogue — Phase 0: skip while a
     // popup covers the canvas so off-screen bubbles aren't allocated/pushed.
     if (!modalOpen && !tabHidden) {
-      this.updateDialogueBubbles();
+      this.dialogueSystem.updateDialogueBubbles();
     }
 
     // Viewport bounds (plus a margin) used to cull off-screen characters.
