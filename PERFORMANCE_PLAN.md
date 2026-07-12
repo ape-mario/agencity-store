@@ -1,6 +1,47 @@
 # Performance improvement plan: decompose `WorldScene.ts`
 
-## Current state
+## Implementation status
+
+Phases 0, 1, 2, and most of 3 are **implemented and verified** (typecheck +
+build clean; 63 vitest tests pass, 53 new). `WorldScene.ts` dropped from
+**10,295 → 3,788 lines** (−63%), with 10 systems extracted under
+`src/app/city/game/systems/`:
+
+| Phase | System | Status | Notes |
+|-------|--------|--------|-------|
+| 0a | update-loop culling | ✅ | viewport character cull, zone-guarded animal loop, modal/hidden pause |
+| 0b | pause-on-popup | ✅ | dialogue bubbles + WS world-state updates gated on modal-open |
+| 0c | memory-leak sweep | ✅ | tutorial listener + lightning/apocalypse/encounter/tooltip/arena timers torn down |
+| 1 | `AudioSystem` | ✅ | all music + SFX; shared AudioContext via getters + `ensureContext()` |
+| 1 | `TooltipSystem` | ✅ | all character + building hover tooltips + hide scheduler |
+| 1 | `EventEffectSystem` | ✅ | celebrations, fireworks, coin rain, announcements, bot-effect dispatch |
+| 1 | `SkySystem` | ✅ | sky gradient, stars, treeline, skyline, time-of-day, sun/moon, weather |
+| 2 | `DecorationSystem` | ✅ | decorations, clouds, animals, Pokémon, beach creatures, fireflies, pollen; per-frame `update()` with Phase 0 culling guards folded in |
+| 2 | `CharacterSystem` | ✅ | autonomous NPC behavior: idle activities, walking, greetings |
+| 2 | `BuildingSystem` | ✅ | building sprite lifecycle: create, update, decay visuals, dormant state |
+| 2 | `EncounterSystem` | ✅ | trigger + cooldown + stun glue (battle engine stays in `lib/`) |
+| 3 | `DialogueSystem` | ✅ | speech-bubble glue (autonomous dialogue + direct speak) |
+| 3 | `AgentSystem` | ✅ | agent-WebSocket glue: connect, world-state poll, command translation |
+| 3 | `CameraSystem` | ✅ | mobile drag/pan/zoom + tap-vs-drag detection |
+| 3 | `PlayerSystem` | ⏳ remaining | local player input, enter/exit world, tap-to-move, spawn/iris, E-key |
+| 3 | `ZoneSystem` | ⏳ remaining | transitionToZone, setupZone, clearCurrentZone, offscreen caching |
+
+### Remaining work
+
+`PlayerSystem` and `ZoneSystem` are the scene's core coordination layer — they
+share ~40 fields with each other, the `update()` loop, the input handlers, and
+the React bridge. They are the highest-risk extractions (interactive movement +
+zone-transition timing with no e2e coverage). A methods-bundle extraction is
+mechanically possible but provides limited decoupling since the systems would
+still reach through the scene for nearly all state; the real win requires the
+shared state to move with the methods, which means touching every call site.
+
+Phase 4 (zone lazy loading, object pooling) and Phase 5 (bundle analyzer,
+phaser chunking) are independent of the remaining extractions and can proceed
+on their own.
+
+## Current state (original, for reference)
+
 
 - `src/app/city/game/scenes/WorldScene.ts` is **10,295 lines / 359 KB**.
 - It contains ~170 class properties and ~140 private/public methods.

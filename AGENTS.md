@@ -59,7 +59,12 @@ src/app/
       scenes/                # Phaser scenes: BootScene, WorldScene, UIScene
       textures/              # procedural texture generation (no image assets)
       zones/                 # per-zone setup (main-city, trending, labs, …)
-      systems/               # (planned — see PERFORMANCE_PLAN.md, not yet created)
+      systems/               # extracted subsystems (see PERFORMANCE_PLAN.md):
+      │                           AudioSystem, TooltipSystem, EventEffectSystem,
+      │                           SkySystem, DecorationSystem, CharacterSystem,
+      │                           BuildingSystem, EncounterSystem, DialogueSystem,
+      │                           AgentSystem, CameraSystem — each takes the scene
+      │                           ref and owns its create/update/cleanup lifecycle.
     characters/              # 17 .character.ts persona definitions
     lib/                     # zustand store, types, encounter engine, speech
     │                           bubbles, agent data, popup state, …
@@ -86,10 +91,15 @@ src/lib/                     # shared utilities (config, providers, rpc, section
 
 - `BootScene.ts` — draws the loader and procedurally generates **all** textures
   at runtime (no image assets ship with the app), then starts WorldScene + UIScene.
-- `WorldScene.ts` — the engine. Currently **~10,300 lines / 359 KB**, mixing
-  player input, camera, zone transitions, characters, buildings, tooltips,
-  audio, sky/weather, dialogue, encounters, effects, and agent WebSocket.
-  Decompose into `systems/` per `PERFORMANCE_PLAN.md`.
+- `WorldScene.ts` — the engine. Originally **~10,300 lines**; now **~3,800
+  lines** after extracting 10 subsystems into `systems/` (audio, tooltip,
+  event-effect, sky/weather, decoration, character, building, encounter,
+  dialogue, agent, camera). It still owns player input, zone transitions, and
+  the `update()`/`cleanup()` coordination. Each system takes the scene ref and
+  exposes `create()`/`init()`/`update()`/`cleanup()`; some keep their state on
+  the scene as public fields because zone files read/write them directly. See
+  `PERFORMANCE_PLAN.md` for the extraction status and the remaining
+  `PlayerSystem` / `ZoneSystem` work.
 - `UIScene.ts` — minimal; only strokes the four green viewport corner brackets.
   All real HUD/overlay UI is rendered in React (`components/`), not Phaser.
 - `textures/*.ts` — generate Phaser textures procedurally. Keys are plain names
