@@ -171,6 +171,11 @@ function GameCanvasInner({ worldState }: GameCanvasProps) {
 
     gameRef.current = new Phaser.Game(config);
 
+    // Expose the Phaser game on window for the e2e smoke test + dev debugging.
+    // The game otherwise lives only in a React ref, unreachable from outside.
+    (window as unknown as { __agencity_game?: Phaser.Game }).__agencity_game =
+      gameRef.current;
+
     // Expose sprite export function globally for development
     // Usage: Open browser console and run window.exportAgentSprites()
     (window as unknown as { exportAgentSprites: () => void }).exportAgentSprites = () => {
@@ -203,6 +208,7 @@ function GameCanvasInner({ worldState }: GameCanvasProps) {
         gameRef.current.destroy(true);
         gameRef.current = null;
       }
+      delete (window as unknown as { __agencity_game?: Phaser.Game }).__agencity_game;
     };
   }, []);
 
