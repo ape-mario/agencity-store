@@ -23,8 +23,8 @@ build clean; 63 vitest tests pass, 53 new). `WorldScene.ts` dropped from
 | 3 | `DialogueSystem` | ✅ | speech-bubble glue (autonomous dialogue + direct speak) |
 | 3 | `AgentSystem` | ✅ | agent-WebSocket glue: connect, world-state poll, command translation |
 | 3 | `CameraSystem` | ✅ | mobile drag/pan/zoom + tap-vs-drag detection |
+| 3 | `ZoneSystem` | ✅ | zone transitions, setup/clear, offscreen caching, popup-building registry |
 | 3 | `PlayerSystem` | ⏳ remaining | local player input, enter/exit world, tap-to-move, spawn/iris, E-key |
-| 3 | `ZoneSystem` | ⏳ remaining | transitionToZone, setupZone, clearCurrentZone, offscreen caching |
 
 ### Remaining work
 
