@@ -105,10 +105,13 @@ export class CameraSystem {
       );
     });
 
-    // Handle pointer up - stop drag + reset wasDragGesture to prevent stale-true
+    // Handle pointer up - stop drag. Do NOT reset wasDragGesture here: this
+    // handler is registered before the tap-to-move / building / NPC pointerup
+    // handlers, so clearing it now would defeat their drag-suppression guard.
+    // wasDragGesture is instead reset at the start of the NEXT gesture, in the
+    // pointerdown handler above.
     this.scene.input.on("pointerup", () => {
       isDragging = false;
-      this.scene.wasDragGesture = false;
     });
 
     // Handle pinch to zoom (two-finger gesture) — disabled in-world

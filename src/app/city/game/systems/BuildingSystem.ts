@@ -97,10 +97,12 @@ export class BuildingSystem {
       createBatch(0);
     }
 
-    // Update ascension showcase labels with platform token data
+    // Update ascension showcase labels with platform token data.
+    // The label game objects are created by zones/ascension.ts and stored on the
+    // scene (not on this system), so read them off the scene.
     const ascensionPlatform = buildings.filter((b) => b.isPlatform && b.zone === "ascension");
     ascensionPlatform.forEach((b, i) => {
-      const label = (this as unknown as Record<string, unknown>)[
+      const label = (this.scene as unknown as Record<string, unknown>)[
         `_platformLabel_ascension_showcase_${i}`
       ];
       if (label && (label as Phaser.GameObjects.Text).active) {
@@ -612,8 +614,9 @@ export class BuildingSystem {
       // already handled this click, skip the building handler to avoid
       // opening a BuildingModal on top of the zone's custom modal.
       // Uses timestamp instead of boolean so the flag auto-expires (100ms)
-      // and can't persist across separate clicks.
-      if (Date.now() - ((this as any)._zoneClickTime || 0) < 100) {
+      // and can't persist across separate clicks. _zoneClickTime is set by
+      // zones/moltbook.ts on the scene, so read it off the scene.
+      if (Date.now() - ((this.scene as any)._zoneClickTime || 0) < 100) {
         return;
       }
 
