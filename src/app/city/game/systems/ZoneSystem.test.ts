@@ -59,7 +59,7 @@ describe("ZoneSystem", () => {
     const data = { id: "b1" } as any;
     sys.registerZonePopupBuilding("b1", sprite, data, "trending", () => {});
     expect(scene.zonePopupBuildings.has("b1")).toBe(true);
-    const entry = scene.zonePopupBuildings.get("b1");
+    const entry = scene.zonePopupBuildings.get("b1")!;
     expect(entry.sprite).toBe(sprite);
     expect(entry.zone).toBe("trending");
   });
@@ -96,9 +96,9 @@ describe("ZoneSystem", () => {
 
   it("hideAllZoneElements hides every element in every zone array without throwing", () => {
     const scene = makeSceneStub();
-    scene.trendingElements.push({ setVisible: vi.fn() });
-    scene.foundersElements.push({ setVisible: vi.fn() });
-    scene.decorations.push({ setVisible: vi.fn() });
+    scene.trendingElements.push({ setVisible: vi.fn() } as any);
+    scene.foundersElements.push({ setVisible: vi.fn() } as any);
+    scene.decorations.push({ setVisible: vi.fn() } as any);
     const sys = new ZoneSystem(scene);
     expect(() => sys.hideAllZoneElements()).not.toThrow();
     expect((scene.trendingElements[0] as any).setVisible).toHaveBeenCalledWith(false);
