@@ -40,6 +40,94 @@ Phase 4 (zone lazy loading, object pooling) and Phase 5 (bundle analyzer,
 phaser chunking) are independent of the remaining extractions and can proceed
 on their own.
 
+### Execution plan for PlayerSystem + ZoneSystem
+
+A full field-level audit (every reader/writer of each candidate field across
+WorldScene, the 8 zone files, GameCanvas.tsx, `update()`, `cleanup()`, and
+`updateWorldState()`) shows the coupling is more tractable than the raw field
+count suggests. Most fields move cleanly; only a small set is genuinely
+shared and needs an explicit contract.
+
+#### State-ownership decisions
+
+**PLAYER fields that MOVE into PlayerSystem** (touched only by player methods):
+`playerSpriteVariant`, `cursors`, `wasdKeys`, `playerVelocity`, `playerWalkCycle`,
+the five `PLAYER_*` speed/accel constants, `sprintKey`, `nearbyNPC`,
+`nearbyBuilding`, `nearbyHelper`, `eKeyPressed`, `helperBubbleManager`,
+`helperLineIndex`, `helperGreeted`, `previousNearbyNPC`, `irisGraphics`,
+`tapMoveSuppressed`, `tutorialStep`, `tutorialArrows`.
+
+**PLAYER fields that STAY on the scene** (shared with ZoneSystem / cleanup / React):
+- `localPlayer` — read by `transitionToZone` (camera re-follow) and by
+  `createCharacterSprite` (tap-distance gate). Expose `playerSystem.getLocalPlayer()`.
+- `playerEnabled` — read once by `createCharacterSprite`. Expose
+  `playerSystem.isEnabled()`.
+- `helperNPC` — **the tightest player↔zone coupling**: created by PlayerSystem,
+  shown/hidden by ZoneSystem (`main-city.ts`, `transitionToZone`,
+  `clearCurrentZone`, `hideAllZoneElements`). Move ownership to PlayerSystem,
+  expose `playerSystem.setHelperVisible(bool)`, and update those 5 call sites.
+- `pendingEnterWorld` — PlayerSystem writes (queues spawn during a transition),
+  `transitionToZone` flushes when the transition completes. Model as an explicit
+  `onTransitionComplete` callback the PlayerSystem registers with ZoneSystem,
+  not a shared mutable field.
+- `cameraFollowing` — PlayerSystem sets, `transitionToZone` reads to stop/restart
+  follow. Expose `playerSystem.notifyZoneChanged(newZone)`.
+- `moveTarget` / `moveTargetBuilding` / `moveTargetNPC` — `transitionToZone`
+  clears all three to cancel active tap-to-move. Expose
+  `playerSystem.cancelMove()`; ZoneSystem calls it instead of nulling the fields.
+
+**PLAYER cleanup-coupling** — `cleanup()` currently reaches into private fields
+directly (`boundEKeyDown`, `interactPrompt`, `tapMarker`, `localPlayerTextureKeys`).
+Give PlayerSystem a `destroy()` and route these through it, matching the pattern
+already used by Audio/Sky/Encounter/Tooltip/EventEffect/Agent systems.
+
+**ZONE fields that MOVE into ZoneSystem** (touched only by zone files + zone
+methods): the 8 `*Elements[]` arrays, the 8 `*ZoneCreated` flags,
+`originalPositions`, `zoneGround`, `zonePath`, `billboardTexts`, `tickerText`,
+`tickerOffset`, `cachedTickerContent`, `tickerWorldStateVersion`,
+`skylineSprites`, `arena*` state (crowd/fighters/health-bars/combo/match),
+`ascensionElements`. (Note: `mainCityElements`, `academyElements`,
+`academyZoneCreated`, `distantSkylineGfx`, `academyBuildings` appear vestigial —
+verify before moving; delete if confirmed unused.)
+
+**ZONE fields that STAY on the scene** (shared with non-zone code):
+- `currentZone` — read by the React bridge (`GameCanvas.tsx:332`),
+  `updateCharacters`, and PlayerSystem (`checkZoneBoundaries`,
+  `checkProximityForInteraction`, `createHelperNPC`). Single most-shared field.
+- `isTransitioning` — written by ZoneSystem, read by PlayerSystem (spawn/tap/move
+  gating).
+- `worldStateVersion` — written by `updateWorldState`, read by the ticker cache
+  in `trending.ts`.
+
+**ZONE cleanup-coupling** — `arenaPollingTimer`, `arenaReplayCleanup`,
+`tickerTimer`, `billboardTimer`, `trafficTimers` are defensively destroyed in
+`cleanup()`. Give ZoneSystem a `destroy()` and route these through it.
+
+#### Sequencing
+
+1. **ZoneSystem first.** It's the more self-contained of the two (only 3 shared
+   fields), and Phase 4 zone lazy-loading is gated on `setupZone` becoming async
+   — which lives in ZoneSystem. Landing ZoneSystem first unblocks Phase 4.
+2. **PlayerSystem second.** It depends on ZoneSystem's contract
+   (`notifyZoneChanged`, `cancelMove`, the `onTransitionComplete` callback) more
+   than ZoneSystem depends on it.
+3. **Do each as two commits:** (a) introduce the contract methods/getters on the
+   scene and update all call sites — behavior identical, no code moves; then
+   (b) move the methods + private fields into the system and flip the scene to
+   delegate. This keeps each diff reviewable and lets the smoke test gate each
+   step.
+
+#### Verification
+
+`typecheck` + `npm run build` + the 63 unit tests do **not** cover the
+interactive behavior these two systems own (movement, zone transitions,
+tap-to-move, E-key interaction). Before each commit, run the e2e smoke test
+(`scripts/smoke-test.mjs`, which now confirms all systems wire + the scene
+survives navigation) **and** a manual smoke pass: enter/exit world, walk through
+every zone, click a building, trigger an encounter, tap-to-move on mobile
+viewport. The Phase 0 culling changes specifically need a "walk away, walk back,
+NPC still moving" check (the plan's risk table flags this).
+
 ## Current state (original, for reference)
 
 
