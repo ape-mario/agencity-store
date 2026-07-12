@@ -23,6 +23,7 @@ import { BuildingSystem } from "../systems/BuildingSystem";
 import { EncounterSystem } from "../systems/EncounterSystem";
 import { AgentSystem } from "../systems/AgentSystem";
 import { DialogueSystem } from "../systems/DialogueSystem";
+import { CameraSystem } from "../systems/CameraSystem";
 import {
   setupTrendingZone,
   clearTrafficTimers,
@@ -166,6 +167,9 @@ export class WorldScene extends Phaser.Scene {
 
   /** Character speech-bubble glue (autonomous dialogue + direct speak). */
   public dialogueSystem: DialogueSystem = new DialogueSystem(this);
+
+  /** Mobile camera drag/pan/zoom + tap-vs-drag detection. */
+  public cameraSystem: CameraSystem = new CameraSystem(this);
 
   /** Sky gradient, stars, time-of-day palette, sun/moon, weather effects.
    *  Constructed in create() once the day/night overlay exists. */
@@ -346,21 +350,21 @@ export class WorldScene extends Phaser.Scene {
   private irisGraphics: Phaser.GameObjects.Graphics | null = null;
 
   // Drag detection: prevents accidental taps when scrolling on mobile
-  private touchStartPos: { x: number; y: number } | null = null;
-  private touchStartTime = 0; // Timestamp of last pointerdown — used to detect long-press sprint
+  public touchStartPos: { x: number; y: number } | null = null;
+  public touchStartTime = 0; // Timestamp of last pointerdown — used to detect long-press sprint
   public wasDragGesture = false; // public: TooltipSystem reads it to suppress profile opens after a drag
   private static readonly TAP_DISTANCE_THRESHOLD = 12; // pixels
   private static readonly LONG_PRESS_SPRINT_MS = 250; // Hold this long to sprint on release
 
   // Tap-to-move (mobile only). `sprint` is set at release time from press duration.
-  private moveTarget: { x: number; sprint: boolean } | null = null;
-  private moveTargetBuilding: GameBuilding | null = null;
-  private moveTargetNPC: GameCharacter | null = null;
+  public moveTarget: { x: number; sprint: boolean } | null = null;
+  public moveTargetBuilding: GameBuilding | null = null;
+  public moveTargetNPC: GameCharacter | null = null;
   private tapMoveSuppressed = false;
   private tapMarker: Phaser.GameObjects.Container | null = null;
 
   // Mobile drag-to-pan disabled when player is in world
-  private mobileDragPanEnabled = true;
+  public mobileDragPanEnabled = true;
 
   constructor() {
     super({ key: "WorldScene" });
@@ -455,7 +459,7 @@ export class WorldScene extends Phaser.Scene {
     this.setupLocalPlayer();
 
     // Setup mobile camera controls (drag to pan, pinch to zoom)
-    this.setupMobileCameraControls();
+    this.cameraSystem.setupMobileCameraControls();
 
     // Set up tap-to-move input handler (mobile only)
     this.setupTapToMove();
@@ -1888,152 +1892,6 @@ export class WorldScene extends Phaser.Scene {
     }
   }
 
-  private setupMobileCameraControls(): void {
-    // Check if mobile
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-
-    // Enable touch input globally for this scene
-    this.input.setTopOnly(false);
-
-    if (!isMobile) return;
-
-    // Set up camera bounds for panning
-    const camera = this.cameras.main;
-    camera.setBounds(0, 0, GAME_WIDTH, GAME_HEIGHT);
-
-    // Track drag state
-    let isDragging = false;
-    let dragStartX = 0;
-    let dragStartY = 0;
-    let cameraStartX = 0;
-    let cameraStartY = 0;
-
-    // Track touch start for tap-vs-drag detection (prevents accidental clicks)
-    // Also records the press start timestamp so pointerup can derive long-press sprint intent.
-    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
-      this.touchStartPos = { x: pointer.x, y: pointer.y };
-      this.touchStartTime = Date.now();
-      this.wasDragGesture = false;
-    });
-
-    // Handle pointer down - start drag (disabled when player is in world — camera follows player)
-    this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
-      if (!this.mobileDragPanEnabled) return;
-      // Only start drag if not clicking on a character/building
-      const hitObjects = this.input.hitTestPointer(pointer);
-      if (hitObjects.length === 0) {
-        isDragging = true;
-        dragStartX = pointer.x;
-        dragStartY = pointer.y;
-        cameraStartX = camera.scrollX;
-        cameraStartY = camera.scrollY;
-      }
-    });
-
-    // Handle pointer move - pan camera + mark drag gesture
-    this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
-      // Mark as drag if finger moved beyond threshold (prevents accidental taps)
-      if (this.touchStartPos && pointer.isDown && !this.wasDragGesture) {
-        const dist = Phaser.Math.Distance.Between(
-          this.touchStartPos.x,
-          this.touchStartPos.y,
-          pointer.x,
-          pointer.y
-        );
-        if (dist > WorldScene.TAP_DISTANCE_THRESHOLD) {
-          this.wasDragGesture = true;
-        }
-      }
-
-      if (!this.mobileDragPanEnabled || !isDragging || !pointer.isDown) return;
-
-      const deltaX = dragStartX - pointer.x;
-      const deltaY = dragStartY - pointer.y;
-
-      // Apply movement scaled by zoom level
-      camera.scrollX = Phaser.Math.Clamp(
-        cameraStartX + deltaX / camera.zoom,
-        0,
-        GAME_WIDTH - camera.width / camera.zoom
-      );
-      camera.scrollY = Phaser.Math.Clamp(
-        cameraStartY + deltaY / camera.zoom,
-        0,
-        GAME_HEIGHT - camera.height / camera.zoom
-      );
-    });
-
-    // Handle pointer up - stop drag + reset wasDragGesture to prevent stale-true
-    this.input.on("pointerup", () => {
-      isDragging = false;
-      this.wasDragGesture = false;
-    });
-
-    // Handle pinch to zoom (two-finger gesture) — disabled in-world
-    let initialPinchDistance = 0;
-    let initialZoom = 1;
-
-    this.input.on("pointerdown", () => {
-      if (this.playerEnabled) return;
-      const pointers = this.input.manager.pointers.filter((p) => p.isDown);
-      if (pointers.length === 2) {
-        initialPinchDistance = Phaser.Math.Distance.Between(
-          pointers[0].x,
-          pointers[0].y,
-          pointers[1].x,
-          pointers[1].y
-        );
-        initialZoom = camera.zoom;
-        isDragging = false;
-      }
-    });
-
-    this.input.on("pointermove", () => {
-      if (this.playerEnabled) return;
-      const pointers = this.input.manager.pointers.filter((p) => p.isDown);
-      if (pointers.length === 2 && initialPinchDistance > 0) {
-        const currentDistance = Phaser.Math.Distance.Between(
-          pointers[0].x,
-          pointers[0].y,
-          pointers[1].x,
-          pointers[1].y
-        );
-        const scale = currentDistance / initialPinchDistance;
-        camera.setZoom(Phaser.Math.Clamp(initialZoom * scale, 0.5, 2));
-      }
-    });
-
-    this.input.on("pointerup", () => {
-      if (this.playerEnabled) return;
-      const pointers = this.input.manager.pointers.filter((p) => p.isDown);
-      if (pointers.length < 2) {
-        initialPinchDistance = 0;
-      }
-    });
-
-    // Double-tap to reset zoom — disabled in-world
-    let lastTapTime = 0;
-    this.input.on("pointerup", () => {
-      if (this.playerEnabled) return;
-      const currentTime = Date.now();
-      if (currentTime - lastTapTime < 300) {
-        camera.setZoom(1);
-        camera.scrollX = 0;
-        camera.scrollY = 0;
-      }
-      lastTapTime = currentTime;
-    });
-
-    // Reset all touch state on system interrupts (incoming call, app switch)
-    this.input.on("pointercancel", () => {
-      this.moveTarget = null;
-      this.moveTargetBuilding = null;
-      this.moveTargetNPC = null;
-      this.wasDragGesture = false;
-      isDragging = false;
-      initialPinchDistance = 0;
-    });
-  }
 
   private handleZoneChange(event: CustomEvent<{ zone: ZoneType }>): void {
     const newZone = event.detail.zone;
