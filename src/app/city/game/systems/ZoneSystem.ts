@@ -5,10 +5,9 @@ import { SCALE } from "../textures/constants";
 const GAME_WIDTH = 1280;
 const GAME_HEIGHT = 960;
 import {
-  clearTrafficTimers,
-  setupTrendingZone, setupBallersZone, setupFoundersZone,
-  setupLabsZone, setupMoltbookZone, setupArenaZone, disconnectArena,
-  setupAscensionZone, disconnectAscension, setupMainCityZone,
+  loadZoneModule,
+  getLoadedZoneModule,
+  clearZoneModuleCache,
 } from "../zones";
 import type { WorldScene } from "../scenes/WorldScene";
 
@@ -42,8 +41,35 @@ export class ZoneSystem {
    * teardown once the timer fields migrate into this system.
    */
   destroy(): void {
-    // Intentionally a no-op for now — see the state-ownership map in
-    // PERFORMANCE_PLAN.md (timer fields stay on the scene until they migrate).
+    // Clear the lazy-loaded zone module cache so a fresh scene re-imports.
+    clearZoneModuleCache();
+  }
+
+  /**
+   * Async setup: dynamic-import the zone's module (cached after first visit)
+   * and call its setup function. The transition overlay stays visible while
+   * the module loads; on repeat visits the cached Promise resolves instantly.
+   */
+  async setupZoneAsync(zone: ZoneType): Promise<void> {
+    const mod = await loadZoneModule(zone);
+    mod.setup(this.scene);
+  }
+
+  /**
+   * Disconnect a zone's optional teardown handler (arena replay, ascension
+   * placeholder). Looks up the already-loaded module synchronously; if the zone
+   * was never visited (module not cached), there's nothing to disconnect.
+   * For trending, calls clearTrafficTimers (also lives in the trending module).
+   */
+  disconnectZone(zone: ZoneType): void {
+    const mod = getLoadedZoneModule(zone);
+    if (!mod) return;
+    if (zone === "trending" && mod.clearTrafficTimers) {
+      mod.clearTrafficTimers(this.scene);
+    }
+    if (mod.disconnect) {
+      mod.disconnect(this.scene);
+    }
   }
 
   handleZoneChange(event: CustomEvent<{ zone: ZoneType }>): void {
@@ -54,8 +80,14 @@ export class ZoneSystem {
     this.transitionToZone(newZone);
   }
 
-  transitionToZone(newZone: ZoneType): void {
+  async transitionToZone(newZone: ZoneType): Promise<void> {
     this.scene.audioSystem.playZoneTransitionSfx();
+
+    // Preload the new zone's module NOW (during the slide-out animation) so
+    // it's cached by the time the slide-in onComplete fires and calls
+    // setupZoneOffscreen. On first visit this downloads the chunk; on repeat
+    // visits the cached Promise resolves instantly.
+    await loadZoneModule(newZone);
 
     // Mark transition in progress and cancel any active tap-to-move
     this.scene.isTransitioning = true;
@@ -358,8 +390,8 @@ export class ZoneSystem {
           this.scene.billboardTimer.destroy();
           this.scene.billboardTimer = null;
         }
-        // Stop traffic timers
-        clearTrafficTimers(this.scene);
+        // Stop traffic timers (trending.ts)
+        this.disconnectZone("trending");
       } else if (this.scene.currentZone === "ballers") {
         this.scene.ballersElements.forEach((el) => (el as any).setVisible(false));
       } else if (this.scene.currentZone === "founders") {
@@ -370,10 +402,10 @@ export class ZoneSystem {
         this.scene.moltbookElements.forEach((el) => (el as any).setVisible(false));
       } else if (this.scene.currentZone === "arena") {
         this.scene.arenaElements.forEach((el) => (el as any).setVisible(false));
-        disconnectArena(this.scene);
+        this.disconnectZone("arena");
       } else if (this.scene.currentZone === "ascension") {
         this.scene.ascensionElements.forEach((el) => (el as any).setVisible(false));
-        disconnectAscension(this.scene);
+        this.disconnectZone("ascension");
       }
 
       // Update zone and set up new content
@@ -497,7 +529,7 @@ export class ZoneSystem {
     });
   }
 
-  setupZoneOffscreen(zone: ZoneType, offsetX: number): void {
+  async setupZoneOffscreen(zone: ZoneType, offsetX: number): Promise<void> {
     // Hide all zone elements once, before setting up the new zone
     this.hideAllZoneElements();
 
@@ -510,7 +542,7 @@ export class ZoneSystem {
     const duration = 400; // Smooth slide-in matching the overall transition feel
 
     if (zone === "trending") {
-      setupTrendingZone(this.scene);
+      await this.setupZoneAsync("trending");
 
       // Offset all new Catalog elements and animate them in
       const newElements = [
@@ -533,7 +565,7 @@ export class ZoneSystem {
         }
       });
     } else if (zone === "ballers") {
-      setupBallersZone(this.scene);
+      await this.setupZoneAsync("ballers");
 
       // Offset all new Ballers Valley elements and animate them in
       const newElements = [...this.scene.ballersElements].filter(Boolean);
@@ -551,7 +583,7 @@ export class ZoneSystem {
         }
       });
     } else if (zone === "founders") {
-      setupFoundersZone(this.scene);
+      await this.setupZoneAsync("founders");
 
       // Offset all new Founder's Corner elements and animate them in
       const newElements = [...this.scene.foundersElements].filter(Boolean);
@@ -569,7 +601,7 @@ export class ZoneSystem {
         }
       });
     } else if (zone === "labs") {
-      setupLabsZone(this.scene);
+      await this.setupZoneAsync("labs");
 
       // Offset all new Tech Labs elements and animate them in
       const newElements = [...this.scene.labsElements].filter(Boolean);
@@ -587,7 +619,7 @@ export class ZoneSystem {
         }
       });
     } else if (zone === "moltbook") {
-      setupMoltbookZone(this.scene);
+      await this.setupZoneAsync("moltbook");
 
       // Offset all new Moltbook Beach elements and animate them in
       const newElements = [...this.scene.moltbookElements].filter(Boolean);
@@ -605,7 +637,7 @@ export class ZoneSystem {
         }
       });
     } else if (zone === "arena") {
-      setupArenaZone(this.scene);
+      await this.setupZoneAsync("arena");
 
       // Offset all new Arena elements and animate them in
       const newElements = [...this.scene.arenaElements].filter(Boolean);
@@ -623,7 +655,7 @@ export class ZoneSystem {
         }
       });
     } else if (zone === "ascension") {
-      setupAscensionZone(this.scene);
+      await this.setupZoneAsync("ascension");
 
       // Ascension elements rise from below (upward float-in)
       const verticalDist = Math.round(300 * SCALE);
@@ -645,7 +677,7 @@ export class ZoneSystem {
         }
       });
     } else {
-      setupMainCityZone(this.scene);
+      await this.setupZoneAsync("main_city");
 
       // Animate Park elements in using their ORIGINAL positions
       const newElements = [...this.scene.decorations, ...this.scene.animals.map((a) => a.sprite)];
@@ -725,11 +757,11 @@ export class ZoneSystem {
     } else if (this.scene.currentZone === "arena") {
       // Hide arena elements and disconnect WebSocket
       this.scene.arenaElements.forEach((el) => (el as any).setVisible(false));
-      disconnectArena(this.scene);
+      this.disconnectZone("arena");
     } else if (this.scene.currentZone === "ascension") {
       // Hide ascension elements and stop polling
       this.scene.ascensionElements.forEach((el) => (el as any).setVisible(false));
-      disconnectAscension(this.scene);
+      this.disconnectZone("ascension");
     } else if (this.scene.currentZone === "main_city") {
       // Main city uses shared decorations, don't destroy them
       // Just hide them
@@ -773,8 +805,8 @@ export class ZoneSystem {
     this.scene.moltbookElements.forEach((el) => (el as any).setVisible(false));
     this.scene.arenaElements.forEach((el) => (el as any).setVisible(false));
     this.scene.ascensionElements.forEach((el) => (el as any).setVisible(false));
-    disconnectArena(this.scene);
-    disconnectAscension(this.scene);
+    this.disconnectZone("arena");
+    this.disconnectZone("ascension");
     if (this.scene.helperNPC) {
       this.scene.helperNPC.setVisible(false);
       const indicator = (this.scene.helperNPC as any)._helperIndicator as Phaser.GameObjects.Text | undefined;
@@ -786,34 +818,13 @@ export class ZoneSystem {
     }
   }
 
-  setupZone(zone: ZoneType): void {
-    switch (zone) {
-      case "labs":
-        setupLabsZone(this.scene);
-        break;
-      case "moltbook":
-        setupMoltbookZone(this.scene);
-        break;
-      case "trending":
-        setupTrendingZone(this.scene);
-        break;
-      case "ballers":
-        setupBallersZone(this.scene);
-        break;
-      case "founders":
-        setupFoundersZone(this.scene);
-        break;
-      case "arena":
-        setupArenaZone(this.scene);
-        break;
-      case "ascension":
-        setupAscensionZone(this.scene);
-        break;
-      case "main_city":
-      default:
-        setupMainCityZone(this.scene);
-        break;
-    }
+  /**
+   * Setup dispatcher — dynamic-imports the zone's module and calls its setup
+   * function. Async because the first visit to a zone downloads its chunk;
+   * repeat visits resolve from the cache instantly.
+   */
+  setupZone(zone: ZoneType): Promise<void> {
+    return this.setupZoneAsync(zone);
   }
 
   // Handle AI behavior commands for characters

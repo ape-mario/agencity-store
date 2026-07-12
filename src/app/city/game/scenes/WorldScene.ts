@@ -26,19 +26,6 @@ import { DialogueSystem } from "../systems/DialogueSystem";
 import { CameraSystem } from "../systems/CameraSystem";
 import { ZoneSystem } from "../systems/ZoneSystem";
 import { PlayerSystem } from "../systems/PlayerSystem";
-import {
-  setupTrendingZone,
-  clearTrafficTimers,
-  setupBallersZone,
-  setupFoundersZone,
-  setupLabsZone,
-  setupMoltbookZone,
-  setupArenaZone,
-  disconnectArena,
-  setupAscensionZone,
-  disconnectAscension,
-  setupMainCityZone,
-} from "../zones";
 const GAME_WIDTH = 1280;
 const GAME_HEIGHT = 960;
 
@@ -769,7 +756,13 @@ export class WorldScene extends Phaser.Scene {
       this.billboardTimer.destroy();
       this.billboardTimer = null;
     }
-    clearTrafficTimers(this);
+    // Inline clearTrafficTimers (was imported from trending.ts, now lazy-loaded).
+    // The function is tiny and must run on every shutdown regardless of whether
+    // the trending zone module was ever imported.
+    this.trafficTimers.forEach((timer) => {
+      if (timer && timer.destroy) timer.destroy();
+    });
+    this.trafficTimers = [];
 
     // Tear down sky/weather timers + emitters (lightning, apocalypse, rain).
     this.skySystem.cleanup();
