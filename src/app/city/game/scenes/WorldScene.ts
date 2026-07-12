@@ -757,23 +757,8 @@ export class WorldScene extends Phaser.Scene {
       }
     });
 
-    // Clean up persistent tap-to-move marker
-    if (this.tapMarker) {
-      this.tweens.killTweensOf(this.tapMarker);
-      this.tapMarker.destroy();
-      this.tapMarker = null;
-    }
-    for (const key of this.localPlayerTextureKeys) {
-      if (this.textures.exists(key)) {
-        this.textures.remove(key);
-      }
-    }
-    this.localPlayerTextureKeys = [];
-    this.pendingEnterWorld = null;
-    if (this.interactPrompt) {
-      this.interactPrompt.destroy();
-      this.interactPrompt = null;
-    }
+    // tapMarker, localPlayerTextureKeys, pendingEnterWorld, interactPrompt, and
+    // the helper NPC are all torn down by playerSystem.destroy() above.
 
     // Clean up zone-specific timers
     if (this.tickerTimer) {

@@ -49,7 +49,6 @@ export class PlayerSystem {
   private helperBubbleManager: SpeechBubbleManager | null = null;
   private helperLineIndex = 0;
   private helperGreeted = false;
-  private previousNearbyNPC: GameCharacter | null = null;
   private irisGraphics: Phaser.GameObjects.Graphics | null = null;
   private tapMoveSuppressed = false;
   private tutorialStep = -1;
@@ -91,9 +90,35 @@ export class PlayerSystem {
       this.scene.interactPrompt.destroy();
       this.scene.interactPrompt = null;
     }
+    // Clear the camera geometry mask BEFORE destroying the iris graphics it
+    // references (exitWorld does the same). Prevents a dangling-mask reference
+    // if the scene shuts down mid-iris-reveal.
     if (this.irisGraphics) {
+      this.scene.cameras.main.clearMask();
       this.irisGraphics.destroy();
       this.irisGraphics = null;
+    }
+    // Tear down the helper NPC: its bubble manager, infinite tweens, indicator,
+    // and shadow. These leak across scene re-mounts if not cleaned up here.
+    if (this.helperBubbleManager) {
+      this.helperBubbleManager.destroy();
+      this.helperBubbleManager = null;
+    }
+    if (this.scene.helperNPC) {
+      this.scene.tweens.killTweensOf(this.scene.helperNPC);
+      const indicator = (this.scene.helperNPC as any)._helperIndicator as
+        | Phaser.GameObjects.Text
+        | undefined;
+      if (indicator) {
+        this.scene.tweens.killTweensOf(indicator);
+        indicator.destroy();
+      }
+      const shadow = (this.scene.helperNPC as any)._shadow as
+        | Phaser.GameObjects.Sprite
+        | undefined;
+      if (shadow) shadow.destroy();
+      this.scene.helperNPC.destroy();
+      this.scene.helperNPC = null;
     }
   }
 
@@ -1226,10 +1251,10 @@ export class PlayerSystem {
     this.nearbyNPC = npcResult.npc;
 
     // NPC Awareness: greet player on first approach
-    if (this.nearbyNPC && this.nearbyNPC !== this.previousNearbyNPC) {
+    if (this.nearbyNPC && this.nearbyNPC !== this.scene.previousNearbyNPC) {
       this.scene.characterSystem.triggerNPCGreeting(this.nearbyNPC);
     }
-    this.previousNearbyNPC = this.nearbyNPC;
+    this.scene.previousNearbyNPC = this.nearbyNPC;
 
     // Check buildings (only if no NPC nearby)
     // Buildings are positioned higher on screen, so use X distance primarily
