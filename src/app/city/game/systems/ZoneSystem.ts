@@ -7,7 +7,6 @@ const GAME_HEIGHT = 960;
 import {
   loadZoneModule,
   getLoadedZoneModule,
-  clearZoneModuleCache,
 } from "../zones";
 import type { WorldScene } from "../scenes/WorldScene";
 
@@ -41,8 +40,11 @@ export class ZoneSystem {
    * teardown once the timer fields migrate into this system.
    */
   destroy(): void {
-    // Clear the lazy-loaded zone module cache so a fresh scene re-imports.
-    clearZoneModuleCache();
+    // The zone module cache (zones/index.ts) is intentionally process-lifetime:
+    // clearing it would force re-downloading chunks on scene re-mount, defeating
+    // the purpose of lazy loading. The cached setup functions are pure
+    // (scene) => void and don't hold stale scene references. So this is a no-op;
+    // retained for lifecycle symmetry with the other systems.
   }
 
   /**
@@ -81,16 +83,29 @@ export class ZoneSystem {
   }
 
   async transitionToZone(newZone: ZoneType): Promise<void> {
+    // Guard against re-entrancy: the await below yields to the event loop, so
+    // a second zone-change event could fire before isTransitioning is set.
+    // Check + set synchronously BEFORE any await.
+    if (newZone === this.scene.currentZone || this.scene.isTransitioning) return;
+    this.scene.isTransitioning = true;
+
     this.scene.audioSystem.playZoneTransitionSfx();
 
     // Preload the new zone's module NOW (during the slide-out animation) so
     // it's cached by the time the slide-in onComplete fires and calls
     // setupZoneOffscreen. On first visit this downloads the chunk; on repeat
     // visits the cached Promise resolves instantly.
-    await loadZoneModule(newZone);
+    try {
+      await loadZoneModule(newZone);
+    } catch (err) {
+      // Chunk-load failure (offline, 404, ad-blocker). Reset the transition
+      // guard so the player isn't soft-locked, and bail without changing zones.
+      console.error(`[ZoneSystem] Failed to load zone "${newZone}" chunk:`, err);
+      this.scene.isTransitioning = false;
+      return;
+    }
 
-    // Mark transition in progress and cancel any active tap-to-move
-    this.scene.isTransitioning = true;
+    // Cancel any active tap-to-move
     this.scene.moveTarget = null;
     this.scene.moveTargetBuilding = null;
     this.scene.moveTargetNPC = null;
@@ -433,8 +448,13 @@ export class ZoneSystem {
       };
       this.scene.ground.setTexture(groundTextures[newZone]);
 
-      // Setup new zone content (will be positioned off-screen initially)
-      this.setupZoneOffscreen(newZone, slideInOffset);
+      // Setup new zone content (will be positioned off-screen initially).
+      // Fire-and-forget: the tween callback can't await. The module was
+      // preloaded in transitionToZone so the await inside resolves from cache
+      // instantly; the .catch() prevents an unhandled rejection if setup throws.
+      this.setupZoneOffscreen(newZone, slideInOffset).catch((err) => {
+        console.error("[ZoneSystem] setupZoneOffscreen failed:", err);
+      });
     });
 
     // Clean up old elements after animation completes
