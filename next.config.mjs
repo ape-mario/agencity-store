@@ -11,12 +11,24 @@
  * mis-detect the workspace root. A standalone scaffold (via create-agenc-store)
  * has no parent lockfile and is unaffected.
  *
+ * ## Bundle analyzer
+ *
+ * Run `ANALYZE=true npm run build` to generate a treemap of the client bundle
+ * at `.next/analyze/`. This is dev-only tooling (no runtime impact); it's how we
+ * measure whether the Phaser game chunk, zone lazy-loading, and the Solana SDK
+ * graph are well-separated or need further splitting.
+ *
  * @type {import('next').NextConfig}
  */
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
+import bundleAnalyzer from "@next/bundle-analyzer";
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+const withBundleAnalyzer = bundleAnalyzer({
+  enabled: process.env.ANALYZE === "true",
+});
 
 const nextConfig = {
   reactStrictMode: true,
@@ -28,4 +40,4 @@ const nextConfig = {
   ],
 };
 
-export default nextConfig;
+export default withBundleAnalyzer(nextConfig);
