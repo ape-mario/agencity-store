@@ -2,10 +2,11 @@
 
 ## Implementation status
 
-Phases 0–3 are **implemented and verified** (typecheck + build clean; 74 vitest
+Phases 0–5 are **implemented and verified** (typecheck + build clean; 74 vitest
 tests pass, 64 new; e2e smoke test passes). `WorldScene.ts` dropped from
 **10,295 → 1,597 lines** (−84.5%), with all 12 systems extracted under
-`src/app/city/game/systems/`:
+`src/app/city/game/systems/`. Zone setup code is lazy-loaded (Phase 4). A
+bundle analyzer is wired (`npm run analyze`, Phase 5).
 
 | Phase | System | Status | Notes |
 |-------|--------|--------|-------|
