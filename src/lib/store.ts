@@ -118,11 +118,41 @@ function toCurateable(row: DecodedProgramAccount<ServiceListing>): CurateableLis
 }
 
 /**
- * List all Active listings: through the hosted indexer client when `api.baseUrl`
+ * Short-TTL in-process cache for the listing read. `/catalog`'s surface check
+ * runs on every navigation to the route, so without this each popup open pays
+ * a 1-2s live indexer round-trip before anything can render. 60s staleness is
+ * fine here — the client catalog refetches live data in the browser anyway.
+ */
+const LISTINGS_TTL_MS = 60_000;
+let listingsCache: {
+  at: number;
+  value: Promise<Array<DecodedProgramAccount<ServiceListing>>>;
+} | null = null;
+
+/**
+ * List all Active listings, cached for `LISTINGS_TTL_MS`. Caches the in-flight
+ * promise (not just the resolved value) so concurrent renders dedupe onto one
+ * transport read; a rejected read is evicted so the next call retries.
+ */
+async function listAll(): Promise<Array<DecodedProgramAccount<ServiceListing>>> {
+  const now = Date.now();
+  if (listingsCache && now - listingsCache.at < LISTINGS_TTL_MS) {
+    return listingsCache.value;
+  }
+  const value = fetchAllListings();
+  listingsCache = { at: now, value };
+  value.catch(() => {
+    if (listingsCache?.value === value) listingsCache = null;
+  });
+  return value;
+}
+
+/**
+ * Uncached transport read: through the hosted indexer client when `api.baseUrl`
  * is a real indexer, otherwise via the kit-RPC gPA path. Both return the SAME
  * `DecodedProgramAccount<ServiceListing>` shape.
  */
-async function listAll(): Promise<Array<DecodedProgramAccount<ServiceListing>>> {
+async function fetchAllListings(): Promise<Array<DecodedProgramAccount<ServiceListing>>> {
   const base = indexerBaseUrl();
   if (base) {
     const indexer = createIndexerClient({
